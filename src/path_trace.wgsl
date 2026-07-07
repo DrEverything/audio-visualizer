@@ -15,9 +15,9 @@ struct Uniforms {
     bvh_offsets: vec4<u32>,
     tri_offsets: vec4<u32>,
     dt: f32,
-    _pad_align2_0: u32,
-    _pad_align2_1: u32,
-    _pad_align2_2: u32,
+    render_mode: u32,
+    tonemap_mode: u32,
+    _pad_align2: u32,
 }
 
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
@@ -164,7 +164,7 @@ struct TriIntersection {
 fn intersect_triangle(ro: vec3<f32>, rd: vec3<f32>, tri_idx: u32) -> TriIntersection {
     var result: TriIntersection;
     result.hit = false;
-
+ 
     let idx0 = indices[tri_idx * 3u + 0u];
     let idx1 = indices[tri_idx * 3u + 1u];
     let idx2 = indices[tri_idx * 3u + 2u];
@@ -661,19 +661,4 @@ fn fs_path_trace(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     return vec4<f32>(final_color, 1.0);
-}
-
-@fragment
-fn fs_display(in: VertexOutput) -> @location(0) vec4<f32> {
-    // Flip Y during sampling to match display target coordinates
-    let sample_uv = vec2<f32>(in.uv.x, 1.0 - in.uv.y);
-    var color = textureSampleLevel(prev_texture, texture_sampler, sample_uv, 0.0).rgb;
-
-    // Reinhard tone mapping
-    color = color / (color + vec3<f32>(1.0));
-    
-    // Gamma correction
-    color = pow(color, vec3<f32>(1.0 / 2.2));
-
-    return vec4<f32>(color, 1.0);
 }
