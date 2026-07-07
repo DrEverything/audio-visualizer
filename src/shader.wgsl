@@ -14,6 +14,10 @@ struct Uniforms {
     accum_frame: u32,
     bvh_offsets: vec4<u32>,
     tri_offsets: vec4<u32>,
+    dt: f32,
+    _pad_align2_0: u32,
+    _pad_align2_1: u32,
+    _pad_align2_2: u32,
 }
 
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
@@ -595,7 +599,42 @@ fn fs_path_trace(in: VertexOutput) -> @location(0) vec4<f32> {
         prev_cam_pos = rotate_x(rotate_y(prev_cam_pos, uniforms.prev_camera_rot.x), uniforms.prev_camera_rot.y);
 
         if (rec.hit) {
-            let P = cam_pos + rd * rec.t;
+            var P = cam_pos + rd * rec.t;
+            
+            // Apply motion vectors / dynamic reprojection for moving objects
+            if (rec.instance_idx == 1) {
+                // Torus / Mechanical Part
+                let center_x = 0.0;
+                let center_z = 0.0;
+                
+                // 1. Current local position (un-rotate by current time)
+                let theta_curr = uniforms.time * 1.2;
+                let cos_curr = cos(-theta_curr);
+                let sin_curr = sin(-theta_curr);
+                
+                var P_local = P;
+                P_local.x = (P.x - center_x) * cos_curr + (P.z - center_z) * sin_curr + center_x;
+                P_local.z = -(P.x - center_x) * sin_curr + (P.z - center_z) * cos_curr + center_z;
+                
+                // 2. Previous world position (rotate by previous time: time - dt)
+                let theta_prev = (uniforms.time - uniforms.dt) * 1.2;
+                let cos_prev = cos(theta_prev);
+                let sin_prev = sin(theta_prev);
+                
+                P.x = (P_local.x - center_x) * cos_prev - (P_local.z - center_z) * sin_prev + center_x;
+                P.z = (P_local.x - center_x) * sin_prev + (P_local.z - center_z) * cos_prev + center_z;
+            } else if (rec.instance_idx == 2) {
+                // Gold Sphere
+                let gold_dy_curr = sin(uniforms.time * 2.5) * 0.4;
+                let gold_dy_prev = sin((uniforms.time - uniforms.dt) * 2.5) * 0.4;
+                P.y = P.y - gold_dy_curr + gold_dy_prev;
+            } else if (rec.instance_idx == 3) {
+                // Glass Sphere
+                let glass_dy_curr = sin(uniforms.time * 2.5 + 3.14159265) * 0.4;
+                let glass_dy_prev = sin((uniforms.time - uniforms.dt) * 2.5 + 3.14159265) * 0.4;
+                P.y = P.y - glass_dy_curr + glass_dy_prev;
+            }
+
             let v_cam = rotate_y(rotate_x(P - prev_cam_pos, -uniforms.prev_camera_rot.y), -uniforms.prev_camera_rot.x);
             if (v_cam.z > 0.001) {
                 let x_screen = (v_cam.x / v_cam.z) * 1.5 / aspect;

@@ -134,6 +134,10 @@ struct RaymarchApp {
     // Scene geometry offsets
     bvh_offsets: [u32; 4],
     tri_offsets: [u32; 4],
+
+    // Frame-by-frame convergence
+    render_frame_by_frame: bool,
+    fps: f32,
 }
 
 #[repr(C)]
@@ -154,6 +158,8 @@ struct PathTraceUniforms {
     accum_frame: u32,
     bvh_offsets: [u32; 4],
     tri_offsets: [u32; 4],
+    dt: f32,
+    _pad_align2: [u32; 3],
 }
 
 impl RaymarchApp {
@@ -306,6 +312,8 @@ impl RaymarchApp {
                 accum_frame: 0,
                 bvh_offsets,
                 tri_offsets,
+                dt: 0.0,
+                _pad_align2: [0; 3],
             }]),
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::UNIFORM,
         });
@@ -332,7 +340,7 @@ impl RaymarchApp {
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
-                        min_binding_size: NonZeroU64::new(96),
+                        min_binding_size: NonZeroU64::new(112),
                     },
                     count: None,
                 },
@@ -544,6 +552,8 @@ impl RaymarchApp {
             shader_error: None,
             bvh_offsets,
             tri_offsets,
+            render_frame_by_frame: false,
+            fps: 30.0,
         })
     }
 
@@ -713,6 +723,14 @@ impl eframe::App for RaymarchApp {
                         anim_changed = true;
                     }
                     ui.add(egui::Slider::new(&mut self.animation_speed, 0.1..=4.0).text("Speed Multiplier"));
+                    if ui.checkbox(&mut self.render_frame_by_frame, "Frame-by-Frame Convergence").changed() {
+                        anim_changed = true;
+                    }
+                    if self.render_frame_by_frame {
+                        if ui.add(egui::Slider::new(&mut self.fps, 10.0..=60.0).text("FPS")).changed() {
+                            anim_changed = true;
+                        }
+                    }
                     if ui.button("Reset Time").clicked() {
                         self.time = 0.0;
                         self.accum_frame = 0;
@@ -881,8 +899,23 @@ impl RaymarchApp {
         let dt = ui.input(|i| i.stable_dt).min(0.1);
         let mut anim_active = false;
 
-        if self.animate {
-            self.time += dt * self.animation_speed;
+        let dt_step = if self.animate {
+            if self.render_frame_by_frame {
+                if self.accum_frame >= self.max_accumulation_frames {
+                    (1.0 / self.fps) * self.animation_speed
+                } else {
+                    0.0
+                }
+            } else {
+                dt * self.animation_speed
+            }
+        } else {
+            0.0
+        };
+
+        if dt_step > 0.0 {
+            self.time += dt_step;
+            self.accum_frame = 0;
             anim_active = true;
         }
 
@@ -927,6 +960,8 @@ impl RaymarchApp {
             accum_frame: self.accum_frame,
             bvh_offsets: self.bvh_offsets,
             tri_offsets: self.tri_offsets,
+            dt: if self.render_frame_by_frame { (1.0 / self.fps) * self.animation_speed } else { dt * self.animation_speed },
+            _pad_align2: [0; 3],
         };
 
         // Update previous camera parameters for the next frame
@@ -934,9 +969,12 @@ impl RaymarchApp {
         self.prev_camera_zoom = self.camera_zoom;
 
         // Increment accumulation frame if static and below limit
-        if !self.animate && !self.auto_rotate_camera && self.accum_frame < self.max_accumulation_frames {
-            self.accum_frame += 1;
-        } else if self.animate || self.auto_rotate_camera {
+        let is_static = !self.auto_rotate_camera && (!self.animate || self.render_frame_by_frame);
+        if is_static {
+            if self.accum_frame < self.max_accumulation_frames {
+                self.accum_frame += 1;
+            }
+        } else {
             self.accum_frame = 0;
         }
 
