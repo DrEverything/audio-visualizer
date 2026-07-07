@@ -12,9 +12,15 @@ def main():
         os.environ["RUST_LOG"] = "info"
 
     # Capture and forward all CLI arguments to cargo run
-    # Example: python run.py --release
+    # Defaults to --release mode unless --debug is explicitly passed.
     args = sys.argv[1:]
-    cmd = ["cargo", "run"] + args
+    if "--debug" in args:
+        args.remove("--debug")
+        cmd = ["cargo", "run"] + args
+    else:
+        if "--release" not in args:
+            args.append("--release")
+        cmd = ["cargo", "run"] + args
 
     print(f"Executing: {' '.join(cmd)}")
 

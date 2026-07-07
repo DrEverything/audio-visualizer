@@ -1,11 +1,13 @@
+mod bvh;
 mod types;
 
 use std::num::NonZeroU64;
-use std::time::Instant;
 
 use eframe::egui;
 use eframe::egui_wgpu::wgpu::util::DeviceExt;
 use eframe::egui_wgpu::{self, wgpu};
+
+use bvh::{GpuMaterial, build_scene};
 
 fn get_backend_from_env() -> wgpu::Backends {
     if let Ok(backend_str) = std::env::var("WGPU_BACKEND") {
@@ -23,7 +25,6 @@ fn get_backend_from_env() -> wgpu::Backends {
 }
 
 fn main() -> eframe::Result {
-    // Initialize logger for debugging
     env_logger::init();
 
     let native_options = eframe::NativeOptions {
@@ -54,20 +55,20 @@ fn main() -> eframe::Result {
             ..Default::default()
         },
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1100.0, 750.0])
+            .with_inner_size([1200.0, 800.0])
             .with_resizable(true)
-            .with_title("Interactive WGPU Raymarching"),
+            .with_title("Physically Accurate GPU Path Tracer"),
         ..Default::default()
     };
 
     eframe::run_native(
-        "Interactive WGPU Raymarching",
+        "Physically Accurate GPU Path Tracer",
         native_options,
         Box::new(|cc| {
             match RaymarchApp::new(cc) {
                 Some(app) => Ok(Box::new(app)),
                 None => {
-                    log::error!("Failed to initialize WGPU renderer. Falling back to simple UI.");
+                    log::error!("Failed to initialize WGPU renderer.");
                     Err("WGPU renderer initialization failed".into())
                 }
             }
@@ -75,45 +76,84 @@ fn main() -> eframe::Result {
     )
 }
 
+struct MaterialParams {
+    name: String,
+    base_color: [f32; 3],
+    metallic: f32,
+    roughness: f32,
+    ior: f32,
+    transmission: f32,
+    emissive: [f32; 3],
+}
+
+impl MaterialParams {
+    fn to_gpu(&self) -> GpuMaterial {
+        GpuMaterial {
+            base_color: [self.base_color[0], self.base_color[1], self.base_color[2], self.metallic],
+            properties: [self.roughness, self.ior, self.transmission, 0.0],
+            emissive: [self.emissive[0], self.emissive[1], self.emissive[2], 0.0],
+        }
+    }
+}
+
 struct RaymarchApp {
-    // UI controls / Uniform fields
-    speed: f32,
-    morph_factor: f32,
+    // Path tracer control parameters
+    max_depth: u32,
+    samples_per_frame: u32,
+    aperture: f32,
+    focal_distance: f32,
+    env_light_intensity: f32,
+    max_accumulation_frames: u32,
+
+    // Animation control parameters
+    animate: bool,
+    auto_rotate_camera: bool,
+    animation_speed: f32,
+    time: f32,
+
+    // Materials list
+    materials: Vec<MaterialParams>,
+    selected_material_idx: usize,
+
+    // Camera settings
     camera_rot: [f32; 2], // yaw, pitch
     camera_zoom: f32,
-    light_dir: [f32; 3],
-    steps: u32,
-    color_palette: u32,
-    glow_intensity: f32,
+    prev_camera_rot: [f32; 2],
+    prev_camera_zoom: f32,
 
-    // Time tracking
-    time: f32,
-    last_time: Instant,
-    
-    // Status flag
+    // Accumulation stats
+    frame_index: u32,
+    accum_frame: u32,
     wgpu_initialized: bool,
 
     // Shader hot reloading
     shader_path: std::path::PathBuf,
     last_shader_modified: Option<std::time::SystemTime>,
     shader_error: Option<String>,
+
+    // Scene geometry offsets
+    bvh_offsets: [u32; 4],
+    tri_offsets: [u32; 4],
 }
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-struct RaymarchUniforms {
+struct PathTraceUniforms {
     resolution: [f32; 2],
-    time: f32,
-    speed: f32,
     camera_rot: [f32; 2],
     camera_zoom: f32,
-    morph_factor: f32,
-    light_dir: [f32; 3],
-    steps: u32,
-    color_palette: u32,
-    glow_intensity: f32,
-    _padding1: u32,
-    _padding2: u32,
+    frame_index: u32,
+    max_depth: u32,
+    samples_per_frame: u32,
+    aperture: f32,
+    focal_distance: f32,
+    env_light_intensity: f32,
+    prev_camera_zoom: f32,
+    prev_camera_rot: [f32; 2],
+    time: f32,
+    accum_frame: u32,
+    bvh_offsets: [u32; 4],
+    tri_offsets: [u32; 4],
 }
 
 impl RaymarchApp {
@@ -121,37 +161,297 @@ impl RaymarchApp {
         let wgpu_render_state = cc.wgpu_render_state.as_ref()?;
         let device = &wgpu_render_state.device;
 
-        // Compile our WGSL shader
+        // 1. Build Scene (Vertices, Indices, Material mapping, and BVH)
+        let (
+            vertices,
+            indices,
+            tri_materials,
+            bvh_nodes,
+            bvh_offsets,
+            tri_offsets,
+        ) = build_scene();
+        log::info!("Scene built with {} vertices, {} triangles, {} BVH nodes.", 
+                  vertices.len(), indices.len() / 3, bvh_nodes.len());
+
+        // 2. Initialize Material definitions
+        let materials = vec![
+            MaterialParams {
+                name: "Left Wall (Red)".to_string(),
+                base_color: [0.75, 0.15, 0.15],
+                metallic: 0.0,
+                roughness: 0.8,
+                ior: 1.5,
+                transmission: 0.0,
+                emissive: [0.0; 3],
+            },
+            MaterialParams {
+                name: "Right Wall (Green)".to_string(),
+                base_color: [0.15, 0.75, 0.15],
+                metallic: 0.0,
+                roughness: 0.8,
+                ior: 1.5,
+                transmission: 0.0,
+                emissive: [0.0; 3],
+            },
+            MaterialParams {
+                name: "Walls/Floor (White)".to_string(),
+                base_color: [0.75, 0.75, 0.75],
+                metallic: 0.0,
+                roughness: 0.8,
+                ior: 1.5,
+                transmission: 0.0,
+                emissive: [0.0; 3],
+            },
+            MaterialParams {
+                name: "Ceiling Light".to_string(),
+                base_color: [0.75, 0.75, 0.75],
+                metallic: 0.0,
+                roughness: 0.8,
+                ior: 1.5,
+                transmission: 0.0,
+                emissive: [12.0, 12.0, 12.0],
+            },
+            MaterialParams {
+                name: "Mechanical Part / Torus".to_string(),
+                base_color: [0.91, 0.92, 0.92],
+                metallic: 1.0,
+                roughness: 0.15,
+                ior: 1.5,
+                transmission: 0.0,
+                emissive: [0.0; 3],
+            },
+            MaterialParams {
+                name: "Gold Sphere".to_string(),
+                base_color: [1.0, 0.78, 0.34],
+                metallic: 1.0,
+                roughness: 0.05,
+                ior: 1.5,
+                transmission: 0.0,
+                emissive: [0.0; 3],
+            },
+            MaterialParams {
+                name: "Glass Sphere".to_string(),
+                base_color: [1.0, 1.0, 1.0],
+                metallic: 0.0,
+                roughness: 0.0,
+                ior: 1.52,
+                transmission: 1.0,
+                emissive: [0.0; 3],
+            },
+            MaterialParams {
+                name: "Front Wall (White)".to_string(),
+                base_color: [0.75, 0.75, 0.75],
+                metallic: 0.0,
+                roughness: 0.8,
+                ior: 1.5,
+                transmission: 0.0,
+                emissive: [0.0; 3],
+            },
+        ];
+
+        let gpu_materials: Vec<GpuMaterial> = materials.iter().map(|m| m.to_gpu()).collect();
+
+        // Compile Shader Module
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("raymarch_shader"),
+            label: Some("path_trace_shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("./shader.wgsl").into()),
         });
 
-        // Create bind group layout for uniforms
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("raymarch_bind_group_layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: NonZeroU64::new(64),
-                },
-                count: None,
-            }],
+        // Create GPU storage and uniform buffers
+        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("vertex_buffer"),
+            contents: bytemuck::cast_slice(&vertices),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("raymarch_pipeline_layout"),
+        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("index_buffer"),
+            contents: bytemuck::cast_slice(&indices),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let tri_material_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("tri_material_buffer"),
+            contents: bytemuck::cast_slice(&tri_materials),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let bvh_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("bvh_buffer"),
+            contents: bytemuck::cast_slice(&bvh_nodes),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let material_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("material_buffer"),
+            contents: bytemuck::cast_slice(&gpu_materials),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("uniform_buffer"),
+            contents: bytemuck::cast_slice(&[PathTraceUniforms {
+                resolution: [800.0, 600.0],
+                camera_rot: [0.0, 0.3],
+                camera_zoom: 5.5,
+                frame_index: 0,
+                max_depth: 4,
+                samples_per_frame: 1,
+                aperture: 0.02,
+                focal_distance: 5.5,
+                env_light_intensity: 0.5,
+                prev_camera_zoom: 5.5,
+                prev_camera_rot: [0.0, 0.3],
+                time: 0.0,
+                accum_frame: 0,
+                bvh_offsets,
+                tri_offsets,
+            }]),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::UNIFORM,
+        });
+
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("accum_sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+
+        // 3. Create Bind Group Layout for Path Tracing
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("path_trace_bind_group_layout"),
+            entries: &[
+                // 0: Uniforms
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: NonZeroU64::new(96),
+                    },
+                    count: None,
+                },
+                // 1: Prev texture view
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // 2: Sampler
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
+                    count: None,
+                },
+                // 3: BVH nodes
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // 4: Vertices
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // 5: Indices
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // 6: Triangle materials
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // 7: Materials
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        // 4. Create Bind Group Layout for Display Blit
+        let display_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("display_bind_group_layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
+                    count: None,
+                },
+            ],
+        });
+
+        let pt_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("pt_pipeline_layout"),
             bind_group_layouts: &[Some(&bind_group_layout)],
             immediate_size: 0,
         });
 
-        // Create render pipeline
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("raymarch_pipeline"),
-            layout: Some(&pipeline_layout),
+        let disp_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("disp_pipeline_layout"),
+            bind_group_layouts: &[Some(&display_bind_group_layout)],
+            immediate_size: 0,
+        });
+
+        // Create Path Tracing Render Pipeline
+        // Target format is Rgba32Float since it renders to the offscreen accumulation textures
+        let path_trace_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("path_trace_pipeline"),
+            layout: Some(&pt_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
@@ -160,7 +460,31 @@ impl RaymarchApp {
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: Some("fs_main"),
+                entry_point: Some("fs_path_trace"),
+                targets: &[Some(wgpu::TextureFormat::Rgba32Float.into())],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        // Create Display Render Pipeline
+        // Target format matches egui's viewport format
+        let display_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("display_pipeline"),
+            layout: Some(&disp_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_display"),
                 targets: &[Some(wgpu_render_state.target_format.into())],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             }),
@@ -171,45 +495,23 @@ impl RaymarchApp {
             cache: None,
         });
 
-        // Initialize uniform buffer
-        let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("raymarch_uniform_buffer"),
-            contents: bytemuck::cast_slice(&[RaymarchUniforms {
-                resolution: [800.0, 600.0],
-                time: 0.0,
-                speed: 1.0,
-                camera_rot: [0.0, 0.0],
-                camera_zoom: 5.0,
-                morph_factor: 0.0,
-                light_dir: [1.0, 1.0, -1.0],
-                steps: 64,
-                color_palette: 0,
-                glow_intensity: 1.0,
-                _padding1: 0,
-                _padding2: 0,
-            }]),
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::UNIFORM,
-        });
-
-        // Create bind group
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("raymarch_bind_group"),
-            layout: &bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform_buffer.as_entire_binding(),
-            }],
-        });
-
-        // Store persistent WGPU resources in eframe's paint_callback_resources
         wgpu_render_state
             .renderer
             .write()
             .callback_resources
             .insert(RaymarchRenderResources {
-                pipeline,
-                bind_group,
+                path_trace_pipeline,
+                display_pipeline,
+                bind_group_layout,
+                display_bind_group_layout,
                 uniform_buffer,
+                vertex_buffer,
+                index_buffer,
+                tri_material_buffer,
+                material_buffer,
+                bvh_buffer,
+                sampler,
+                textures: std::sync::Mutex::new(None),
             });
 
         let shader_path = std::path::PathBuf::from("src/shader.wgsl");
@@ -218,20 +520,30 @@ impl RaymarchApp {
             .ok();
 
         Some(Self {
-            speed: 1.0,
-            morph_factor: 0.5,
+            max_depth: 4,
+            samples_per_frame: 1,
+            aperture: 0.02,
+            focal_distance: 5.5,
+            env_light_intensity: 0.4,
+            max_accumulation_frames: 1024,
+            animate: false,
+            auto_rotate_camera: false,
+            animation_speed: 1.0,
+            time: 0.0,
+            materials,
+            selected_material_idx: 4, // default to Mechanical Part
             camera_rot: [0.0, 0.3],
             camera_zoom: 5.5,
-            light_dir: [1.5, 2.0, -1.0],
-            steps: 80,
-            color_palette: 0,
-            glow_intensity: 1.2,
-            time: 0.0,
-            last_time: Instant::now(),
+            prev_camera_rot: [0.0, 0.3],
+            prev_camera_zoom: 5.5,
+            frame_index: 0,
+            accum_frame: 0,
             wgpu_initialized: true,
             shader_path,
             last_shader_modified,
             shader_error: None,
+            bvh_offsets,
+            tri_offsets,
         })
     }
 
@@ -244,57 +556,11 @@ impl RaymarchApp {
             }
         };
 
-        // Push validation error scope
         let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
 
-        // Create shader module
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("raymarch_shader_hot"),
+            label: Some("path_trace_shader_hot"),
             source: wgpu::ShaderSource::Wgsl(shader_source.into()),
-        });
-
-        // Recreate bind group layout
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("raymarch_bind_group_layout_hot"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: NonZeroU64::new(64),
-                },
-                count: None,
-            }],
-        });
-
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("raymarch_pipeline_layout_hot"),
-            bind_group_layouts: &[Some(&bind_group_layout)],
-            immediate_size: 0,
-        });
-
-        // Create pipeline
-        let _pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("raymarch_pipeline_hot"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &[],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(render_state.target_format.into())],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
         });
 
         // Pop validation error scope
@@ -304,22 +570,75 @@ impl RaymarchApp {
             self.shader_error = Some(format!("Shader validation error:\n{}", err));
             log::error!("Shader validation error: {}", err);
         } else {
-            // Re-fetch pipeline creation inside safety boundary
             let mut renderer_lock = render_state.renderer.write();
-            if let Some(raymarch_res) = renderer_lock.callback_resources.get_mut::<RaymarchRenderResources>() {
-                let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("raymarch_bind_group_hot"),
-                    layout: &bind_group_layout,
-                    entries: &[wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: raymarch_res.uniform_buffer.as_entire_binding(),
-                    }],
+            if let Some(res) = renderer_lock.callback_resources.get_mut::<RaymarchRenderResources>() {
+                // Recreate pipelines using the same layouts
+                let pt_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("pt_pipeline_layout_hot"),
+                    bind_group_layouts: &[Some(&res.bind_group_layout)],
+                    immediate_size: 0,
                 });
 
-                raymarch_res.pipeline = _pipeline;
-                raymarch_res.bind_group = bind_group;
-                
+                let disp_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("disp_pipeline_layout_hot"),
+                    bind_group_layouts: &[Some(&res.display_bind_group_layout)],
+                    immediate_size: 0,
+                });
+
+                let new_pt_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("path_trace_pipeline_hot"),
+                    layout: Some(&pt_pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &shader,
+                        entry_point: Some("vs_main"),
+                        buffers: &[],
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &shader,
+                        entry_point: Some("fs_path_trace"),
+                        targets: &[Some(wgpu::TextureFormat::Rgba32Float.into())],
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    }),
+                    primitive: wgpu::PrimitiveState::default(),
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview_mask: None,
+                    cache: None,
+                });
+
+                let new_disp_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("display_pipeline_hot"),
+                    layout: Some(&disp_pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &shader,
+                        entry_point: Some("vs_main"),
+                        buffers: &[],
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &shader,
+                        entry_point: Some("fs_display"),
+                        targets: &[Some(render_state.target_format.into())],
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    }),
+                    primitive: wgpu::PrimitiveState::default(),
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview_mask: None,
+                    cache: None,
+                });
+
+                res.path_trace_pipeline = new_pt_pipeline;
+                res.display_pipeline = new_disp_pipeline;
+
+                // Force textures recreate to bind correctly
+                if let Ok(mut tex_guard) = res.textures.lock() {
+                    *tex_guard = None;
+                }
+
                 self.shader_error = None;
+                self.frame_index = 0;
                 log::info!("Shader hot-reloaded successfully!");
             }
         }
@@ -332,13 +651,13 @@ impl eframe::App for RaymarchApp {
         if !self.wgpu_initialized {
             egui::CentralPanel::default().show(ui, |ui| {
                 ui.centered_and_justified(|ui| {
-                    ui.heading("WGPU renderer failed to initialize. Please check support.");
+                    ui.heading("WGPU renderer failed to initialize.");
                 });
             });
             return;
         }
 
-        // Check for shader file modifications to support hot reloading
+        // Check for shader file changes for hot reloading
         if let Some(render_state) = _frame.wgpu_render_state() {
             if let Ok(metadata) = std::fs::metadata(&self.shader_path) {
                 if let Ok(modified) = metadata.modified() {
@@ -350,25 +669,20 @@ impl eframe::App for RaymarchApp {
             }
         }
 
-        // Calculate delta time
-        let now = Instant::now();
-        let dt = now.duration_since(self.last_time).as_secs_f32();
-        self.last_time = now;
-        self.time += dt;
+        // Continually request repaint if animating or if we have not reached max convergence
+        if self.animate || self.auto_rotate_camera || self.accum_frame < self.max_accumulation_frames {
+            ctx.request_repaint();
+        }
 
-        // Repaint continuously to support animation
-        ctx.request_repaint();
-
-        // Layout sidebar panels and main content
-        egui::Panel::left("control_panel")
+        // Control Panel Sidebar
+        egui::Panel::left("pt_control_panel")
             .resizable(true)
-            .default_size(320.0)
+            .default_size(340.0)
             .show(ui, |ui| {
                 ui.add_space(10.0);
-                ui.heading("Raymarching Parameters");
+                ui.heading("Path Tracer Controls");
                 ui.add_space(15.0);
 
-                // Show shader errors in the sidebar if any compile failed
                 if let Some(ref err) = self.shader_error {
                     ui.group(|ui| {
                         ui.colored_label(egui::Color32::LIGHT_RED, "❌ Shader Error:");
@@ -379,85 +693,179 @@ impl eframe::App for RaymarchApp {
                     ui.add_space(10.0);
                 }
 
+                // Ray stats
                 ui.group(|ui| {
-                    ui.label("Animation");
-                    ui.add(egui::Slider::new(&mut self.speed, 0.0..=2.0).text("Speed"));
-                    if ui.button("Pause").clicked() {
-                        self.speed = 0.0;
-                    }
-                    if ui.button("Play").clicked() {
-                        self.speed = 1.0;
+                    ui.label(format!("Accumulated Frames: {} / {}", self.accum_frame, self.max_accumulation_frames));
+                    if ui.button("Reset Accumulation").clicked() {
+                        self.accum_frame = 0;
                     }
                 });
-                
                 ui.add_space(10.0);
 
+                // Animation Controls
                 ui.group(|ui| {
-                    ui.label("Morph Factor (SDF Blend)");
-                    ui.add(egui::Slider::new(&mut self.morph_factor, 0.0..=2.0)
-                        .text("Sphere ➔ Torus ➔ Box"));
-                    ui.label("Controls the smooth minimum blending of the primary geometry.");
+                    ui.label("Animation Controls");
+                    let mut anim_changed = false;
+                    if ui.checkbox(&mut self.animate, "Animate Objects").changed() {
+                        anim_changed = true;
+                    }
+                    if ui.checkbox(&mut self.auto_rotate_camera, "Auto-rotate Camera").changed() {
+                        anim_changed = true;
+                    }
+                    ui.add(egui::Slider::new(&mut self.animation_speed, 0.1..=4.0).text("Speed Multiplier"));
+                    if ui.button("Reset Time").clicked() {
+                        self.time = 0.0;
+                        self.accum_frame = 0;
+                    }
+                    if anim_changed {
+                        self.accum_frame = 0;
+                    }
                 });
-
                 ui.add_space(10.0);
 
+                // Render Settings
                 ui.group(|ui| {
-                    ui.label("Rendering Quality");
-                    ui.add(egui::Slider::new(&mut self.steps, 16..=128).text("Max Steps"));
-                    ui.add(egui::Slider::new(&mut self.glow_intensity, 0.0..=3.0).text("Glow Intensity"));
+                    ui.label("Rendering Settings");
+                    if ui.add(egui::Slider::new(&mut self.samples_per_frame, 1..=8).text("Samples/Frame")).changed() {
+                        self.accum_frame = 0;
+                    }
+                    if ui.add(egui::Slider::new(&mut self.max_depth, 1..=8).text("Max Bounces")).changed() {
+                        self.accum_frame = 0;
+                    }
+                    if ui.add(egui::Slider::new(&mut self.env_light_intensity, 0.0..=2.0).text("Sky Intensity")).changed() {
+                        self.accum_frame = 0;
+                    }
+                    if ui.add(egui::Slider::new(&mut self.max_accumulation_frames, 1..=2048).text("Max Accum Frames")).changed() {
+                        self.accum_frame = 0;
+                    }
                 });
-
                 ui.add_space(10.0);
 
+                // Depth of field
                 ui.group(|ui| {
-                    ui.label("Color Scheme");
-                    egui::ComboBox::from_label("Palette")
-                        .selected_text(match self.color_palette {
-                            0 => "Neon Rainbow",
-                            1 => "Sunset Warmth",
-                            2 => "Forest Gold",
-                            3 => "Cyberpunk",
-                            _ => "Unknown",
-                        })
+                    ui.label("Depth of Field (Camera)");
+                    if ui.add(egui::Slider::new(&mut self.aperture, 0.0..=0.4).text("Aperture")).changed() {
+                        self.accum_frame = 0;
+                    }
+                    if ui.add(egui::Slider::new(&mut self.focal_distance, 1.0..=12.0).text("Focus Dist")).changed() {
+                        self.accum_frame = 0;
+                    }
+                });
+                ui.add_space(10.0);
+
+                // Interactive Material Editor
+                ui.group(|ui| {
+                    ui.label("Interactive Material Editor");
+                    
+                    let prev_idx = self.selected_material_idx;
+                    egui::ComboBox::from_label("Selected Material")
+                        .selected_text(&self.materials[self.selected_material_idx].name)
                         .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut self.color_palette, 0, "Neon Rainbow");
-                            ui.selectable_value(&mut self.color_palette, 1, "Sunset Warmth");
-                            ui.selectable_value(&mut self.color_palette, 2, "Forest Gold");
-                            ui.selectable_value(&mut self.color_palette, 3, "Cyberpunk");
+                            for (idx, mat) in self.materials.iter().enumerate() {
+                                ui.selectable_value(&mut self.selected_material_idx, idx, &mat.name);
+                            }
                         });
-                });
 
-                ui.add_space(10.0);
+                    if self.selected_material_idx != prev_idx {
+                        // Reset selection focus but don't need to rebuild
+                    }
 
-                ui.group(|ui| {
-                    ui.label("Lighting Direction");
-                    ui.add(egui::Slider::new(&mut self.light_dir[0], -3.0..=3.0).text("Light X"));
-                    ui.add(egui::Slider::new(&mut self.light_dir[1], 0.1..=4.0).text("Light Y"));
-                    ui.add(egui::Slider::new(&mut self.light_dir[2], -3.0..=3.0).text("Light Z"));
+                    ui.add_space(8.0);
+                    let mut mat_changed = false;
+                    let mat = &mut self.materials[self.selected_material_idx];
+
+                    // Base Color Picker
+                    ui.horizontal(|ui| {
+                        ui.label("Base Color:");
+                        if ui.color_edit_button_rgb(&mut mat.base_color).changed() {
+                            mat_changed = true;
+                        }
+                    });
+
+                    // Roughness & Metallic
+                    if ui.add(egui::Slider::new(&mut mat.roughness, 0.0..=1.0).text("Roughness")).changed() {
+                        mat_changed = true;
+                    }
+                    if ui.add(egui::Slider::new(&mut mat.metallic, 0.0..=1.0).text("Metallic")).changed() {
+                        mat_changed = true;
+                    }
+
+                    // Transmission & Refraction (IOR)
+                    if ui.add(egui::Slider::new(&mut mat.transmission, 0.0..=1.0).text("Transmission (Glass)")).changed() {
+                        mat_changed = true;
+                    }
+                    if ui.add(egui::Slider::new(&mut mat.ior, 1.0..=2.5).text("Index of Refraction")).changed() {
+                        mat_changed = true;
+                    }
+
+                    // Emissive
+                    ui.horizontal(|ui| {
+                        ui.label("Emissive:");
+                        if ui.color_edit_button_rgb(&mut mat.emissive).changed() {
+                            mat_changed = true;
+                        }
+                    });
+                    
+                    if mat_changed {
+                        self.accum_frame = 0;
+                        // Write updated materials list to GPU buffer
+                        if let Some(render_state) = _frame.wgpu_render_state() {
+                            let gpu_mats: Vec<GpuMaterial> = self.materials.iter().map(|m| m.to_gpu()).collect();
+                            let renderer_lock = render_state.renderer.read();
+                            if let Some(res) = renderer_lock.callback_resources.get::<RaymarchRenderResources>() {
+                                render_state.queue.write_buffer(&res.material_buffer, 0, bytemuck::cast_slice(&gpu_mats));
+                            }
+                        }
+                    }
                 });
 
                 ui.add_space(20.0);
-                
-                if ui.button("Reset Defaults").clicked() {
-                    self.speed = 1.0;
-                    self.morph_factor = 0.5;
+                if ui.button("Reset Scene Defaults").clicked() {
                     self.camera_rot = [0.0, 0.3];
                     self.camera_zoom = 5.5;
-                    self.light_dir = [1.5, 2.0, -1.0];
-                    self.steps = 80;
-                    self.color_palette = 0;
-                    self.glow_intensity = 1.2;
+                    self.max_depth = 4;
+                    self.samples_per_frame = 1;
+                    self.aperture = 0.02;
+                    self.focal_distance = 5.5;
+                    self.env_light_intensity = 0.4;
+                    self.max_accumulation_frames = 1024;
+                    self.animate = false;
+                    self.auto_rotate_camera = false;
+                    self.animation_speed = 1.0;
+                    self.time = 0.0;
+                    self.accum_frame = 0;
+                    
+                    // Reset materials
+                    self.materials[0].base_color = [0.75, 0.15, 0.15]; // Red
+                    self.materials[1].base_color = [0.15, 0.75, 0.15]; // Green
+                    self.materials[2].base_color = [0.75, 0.75, 0.75]; // White
+                    self.materials[3].emissive = [12.0, 12.0, 12.0];
+                    self.materials[4].roughness = 0.15;
+                    self.materials[4].metallic = 1.0;
+                    self.materials[5].roughness = 0.05;
+                    self.materials[5].metallic = 1.0;
+                    self.materials[6].transmission = 1.0;
+                    self.materials[6].roughness = 0.0;
+
+                    if let Some(render_state) = _frame.wgpu_render_state() {
+                        let gpu_mats: Vec<GpuMaterial> = self.materials.iter().map(|m| m.to_gpu()).collect();
+                        let renderer_lock = render_state.renderer.read();
+                        if let Some(res) = renderer_lock.callback_resources.get::<RaymarchRenderResources>() {
+                            render_state.queue.write_buffer(&res.material_buffer, 0, bytemuck::cast_slice(&gpu_mats));
+                        }
+                    }
                 }
-                
+
                 ui.add_space(10.0);
                 ui.separator();
                 ui.add_space(10.0);
                 ui.vertical_centered(|ui| {
-                    ui.weak("Drag the viewport to rotate camera");
-                    ui.weak("Use mouse wheel to zoom");
+                    ui.weak("Drag on the canvas to rotate camera");
+                    ui.weak("Scroll wheel to zoom camera");
                 });
             });
 
+        // Viewport canvas
         egui::CentralPanel::default().show(ui, |ui| {
             egui::Frame::canvas(ui.style()).show(ui, |ui| {
                 self.render_canvas(ui);
@@ -468,39 +876,74 @@ impl eframe::App for RaymarchApp {
 
 impl RaymarchApp {
     fn render_canvas(&mut self, ui: &mut egui::Ui) {
-        // Allocate all available space for the shader canvas
         let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::drag());
 
-        // Handle camera rotation by mouse drag
+        let dt = ui.input(|i| i.stable_dt).min(0.1);
+        let mut anim_active = false;
+
+        if self.animate {
+            self.time += dt * self.animation_speed;
+            anim_active = true;
+        }
+
+        if self.auto_rotate_camera {
+            self.camera_rot[0] += dt * 0.15 * self.animation_speed;
+            anim_active = true;
+        }
+
+        // Handle camera navigation
+        let mut cam_changed = false;
         if response.dragged() {
             self.camera_rot[0] += response.drag_delta().x * 0.005; // Yaw
             self.camera_rot[1] = (self.camera_rot[1] + response.drag_delta().y * 0.005)
-                .clamp(-1.4, 1.4); // Pitch clamped to avoid flipping upside down
+                .clamp(-1.4, 1.4); // Pitch
+            cam_changed = true;
         }
 
-        // Handle camera zoom via mouse scroll
         let scroll_delta = ui.input(|i| i.smooth_scroll_delta.y);
         if scroll_delta != 0.0 {
             self.camera_zoom = (self.camera_zoom - scroll_delta * 0.005).clamp(2.0, 12.0);
+            cam_changed = true;
         }
 
-        // Prepare uniforms structure
-        let uniforms = RaymarchUniforms {
+        if cam_changed || anim_active {
+            self.accum_frame = 0;
+        }
+
+        // Prepare uniforms struct
+        let uniforms = PathTraceUniforms {
             resolution: [rect.width(), rect.height()],
-            time: self.time,
-            speed: self.speed,
             camera_rot: self.camera_rot,
             camera_zoom: self.camera_zoom,
-            morph_factor: self.morph_factor,
-            light_dir: self.light_dir,
-            steps: self.steps,
-            color_palette: self.color_palette,
-            glow_intensity: self.glow_intensity,
-            _padding1: 0,
-            _padding2: 0,
+            frame_index: self.frame_index,
+            max_depth: self.max_depth,
+            samples_per_frame: self.samples_per_frame,
+            aperture: self.aperture,
+            focal_distance: self.focal_distance,
+            env_light_intensity: self.env_light_intensity,
+            prev_camera_zoom: self.prev_camera_zoom,
+            prev_camera_rot: self.prev_camera_rot,
+            time: self.time,
+            accum_frame: self.accum_frame,
+            bvh_offsets: self.bvh_offsets,
+            tri_offsets: self.tri_offsets,
         };
 
-        // Add custom WGPU callback to paint
+        // Update previous camera parameters for the next frame
+        self.prev_camera_rot = self.camera_rot;
+        self.prev_camera_zoom = self.camera_zoom;
+
+        // Increment accumulation frame if static and below limit
+        if !self.animate && !self.auto_rotate_camera && self.accum_frame < self.max_accumulation_frames {
+            self.accum_frame += 1;
+        } else if self.animate || self.auto_rotate_camera {
+            self.accum_frame = 0;
+        }
+
+        // Always increment frame_index for ping-ponging and noise seeding
+        self.frame_index = self.frame_index.wrapping_add(1);
+
+        // Custom WGPU callback
         ui.painter().add(egui_wgpu::Callback::new_paint_callback(
             rect,
             RaymarchCallback { uniforms },
@@ -508,24 +951,74 @@ impl RaymarchApp {
     }
 }
 
-// Custom paint callback data containing state for a single frame
 struct RaymarchCallback {
-    uniforms: RaymarchUniforms,
+    uniforms: PathTraceUniforms,
 }
 
 impl egui_wgpu::CallbackTrait for RaymarchCallback {
     fn prepare(
         &self,
-        _device: &wgpu::Device,
+        device: &wgpu::Device,
         queue: &wgpu::Queue,
         _screen_descriptor: &egui_wgpu::ScreenDescriptor,
         _egui_encoder: &mut wgpu::CommandEncoder,
         resources: &mut egui_wgpu::CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
-        if let Some(raymarch_res) = resources.get::<RaymarchRenderResources>() {
-            raymarch_res.prepare(queue, self.uniforms);
+        let mut cmd_buffers = Vec::new();
+        if let Some(raymarch_res) = resources.get_mut::<RaymarchRenderResources>() {
+            // Write uniforms to the GPU buffer
+            queue.write_buffer(&raymarch_res.uniform_buffer, 0, bytemuck::cast_slice(&[self.uniforms]));
+
+            // Ensure accumulation textures are allocated at the correct size
+            let width = self.uniforms.resolution[0].max(1.0) as u32;
+            let height = self.uniforms.resolution[1].max(1.0) as u32;
+
+            let mut tex_lock = raymarch_res.textures.lock().unwrap();
+            let need_recreate = tex_lock.as_ref().map_or(true, |tex| tex.width != width || tex.height != height);
+
+            if need_recreate {
+                *tex_lock = Some(AccumTextures::new(device, width, height, raymarch_res));
+            }
+
+            // Run offscreen path tracing pass (accumulating from previous texture to target texture)
+            if let Some(ref textures) = *tex_lock {
+                // Read from B, write to A (frame_index % 2 == 0)
+                // Read from A, write to B (frame_index % 2 == 1)
+                let use_a = self.uniforms.frame_index % 2 == 0;
+                let target_view = if use_a { &textures.view_a } else { &textures.view_b };
+                let bind_group_pt = if use_a { &textures.bind_group_pt_a } else { &textures.bind_group_pt_b };
+
+                let mut pt_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("pt_pass_encoder"),
+                });
+
+                {
+                    let mut render_pass = pt_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("path_trace_pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: target_view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+
+                    render_pass.set_pipeline(&raymarch_res.path_trace_pipeline);
+                    render_pass.set_bind_group(0, bind_group_pt, &[]);
+                    render_pass.draw(0..6, 0..1);
+                }
+
+                cmd_buffers.push(pt_encoder.finish());
+            }
         }
-        Vec::new()
+        cmd_buffers
     }
 
     fn paint(
@@ -535,28 +1028,205 @@ impl egui_wgpu::CallbackTrait for RaymarchCallback {
         resources: &egui_wgpu::CallbackResources,
     ) {
         if let Some(raymarch_res) = resources.get::<RaymarchRenderResources>() {
-            raymarch_res.paint(render_pass);
+            let tex_lock = raymarch_res.textures.lock().unwrap();
+            if let Some(ref textures) = *tex_lock {
+                // The blit pipeline reads from the texture we just finished writing to:
+                // If uniforms.frame_index % 2 == 0, we just wrote to View A, so blit reads from A.
+                // If uniforms.frame_index % 2 == 1, we just wrote to View B, so blit reads from B.
+                let use_a = self.uniforms.frame_index % 2 == 0;
+                let bind_group_disp = if use_a { &textures.bind_group_disp_a } else { &textures.bind_group_disp_b };
+
+                render_pass.set_pipeline(&raymarch_res.display_pipeline);
+                render_pass.set_bind_group(0, bind_group_disp, &[]);
+                render_pass.draw(0..6, 0..1);
+            }
         }
     }
 }
 
-// Persistent resources stored in eframe's paint_callback_resources
 struct RaymarchRenderResources {
-    pipeline: wgpu::RenderPipeline,
-    bind_group: wgpu::BindGroup,
+    path_trace_pipeline: wgpu::RenderPipeline,
+    display_pipeline: wgpu::RenderPipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    display_bind_group_layout: wgpu::BindGroupLayout,
     uniform_buffer: wgpu::Buffer,
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
+    tri_material_buffer: wgpu::Buffer,
+    material_buffer: wgpu::Buffer,
+    bvh_buffer: wgpu::Buffer,
+    sampler: wgpu::Sampler,
+    textures: std::sync::Mutex<Option<AccumTextures>>,
 }
 
-impl RaymarchRenderResources {
-    fn prepare(&self, queue: &wgpu::Queue, uniforms: RaymarchUniforms) {
-        // Write the uniforms structure into the GPU buffer
-        queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
-    }
+struct AccumTextures {
+    width: u32,
+    height: u32,
+    #[allow(dead_code)]
+    texture_a: wgpu::Texture,
+    view_a: wgpu::TextureView,
+    #[allow(dead_code)]
+    texture_b: wgpu::Texture,
+    view_b: wgpu::TextureView,
+    bind_group_pt_a: wgpu::BindGroup,
+    bind_group_pt_b: wgpu::BindGroup,
+    bind_group_disp_a: wgpu::BindGroup,
+    bind_group_disp_b: wgpu::BindGroup,
+}
 
-    fn paint(&self, render_pass: &mut wgpu::RenderPass<'_>) {
-        render_pass.set_pipeline(&self.pipeline);
-        render_pass.set_bind_group(0, &self.bind_group, &[]);
-        // Draw 3 vertices for a single screen-covering triangle
-        render_pass.draw(0..3, 0..1);
+impl AccumTextures {
+    fn new(
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+        res: &RaymarchRenderResources,
+    ) -> Self {
+        let size = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+
+        let texture_desc = wgpu::TextureDescriptor {
+            label: Some("accum_texture"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        };
+
+        let texture_a = device.create_texture(&texture_desc);
+        let view_a = texture_a.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let texture_b = device.create_texture(&texture_desc);
+        let view_b = texture_b.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // Bind Group PT A: reads B, writes A
+        let bind_group_pt_a = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("bind_group_pt_a"),
+            layout: &res.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: res.uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&view_b),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&res.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: res.bvh_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: res.vertex_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: res.index_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: res.tri_material_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: res.material_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        // Bind Group PT B: reads A, writes B
+        let bind_group_pt_b = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("bind_group_pt_b"),
+            layout: &res.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: res.uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&view_a),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&res.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: res.bvh_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: res.vertex_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: res.index_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: res.tri_material_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: res.material_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        // Display Bind Group A: reads A
+        let bind_group_disp_a = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("bind_group_disp_a"),
+            layout: &res.display_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&view_a),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&res.sampler),
+                },
+            ],
+        });
+
+        // Display Bind Group B: reads B
+        let bind_group_disp_b = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("bind_group_disp_b"),
+            layout: &res.display_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&view_b),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&res.sampler),
+                },
+            ],
+        });
+
+        Self {
+            width,
+            height,
+            texture_a,
+            view_a,
+            texture_b,
+            view_b,
+            bind_group_pt_a,
+            bind_group_pt_b,
+            bind_group_disp_a,
+            bind_group_disp_b,
+        }
     }
 }
