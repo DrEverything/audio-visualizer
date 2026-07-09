@@ -4,12 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-eframe = { version = "0.35.0", features = ["wgpu"] }
+eframe = { version = "0.35.0", features = ["wgpu", "persistence"] }
 bytemuck = { version = "1.25.0", features = ["derive"] }
 env_logger = "0.11"
 log = "0.4"
 pollster = "0.4"
 gltf = "1.4.1"
+rodio = "0.22.2"
+rustfft = "6.4.1"
 
 
 [profile.dev]

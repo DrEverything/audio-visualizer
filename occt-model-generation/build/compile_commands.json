@@ -1,8 +1,0 @@
-[
-{
-  "directory": "C:/Users/chris/Developer/uni-ass/build",
-  "command": "C:\\PROGRA~1\\MICROS~1\\2022\\COMMUN~1\\VC\\Tools\\Llvm\\x64\\bin\\CLANG_~1.EXE -isystem C:/libs/occt/opencascade-8.0.0-vc14-64/inc -O0 -g -Xclang -gcodeview -std=gnu++17 -D_DEBUG -D_DLL -D_MT -Xclang --dependent-lib=msvcrtd -o CMakeFiles\\occt_example.dir\\main.cpp.obj -c C:\\Users\\chris\\Developer\\uni-ass\\main.cpp",
-  "file": "C:\\Users\\chris\\Developer\\uni-ass\\main.cpp",
-  "output": "CMakeFiles\\occt_example.dir\\main.cpp.obj"
-}
-]

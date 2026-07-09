@@ -1,4 +1,0 @@
-C:/Users/chris/Developer/uni-ass/build/CMakeFiles/occt_example.dir
-C:/Users/chris/Developer/uni-ass/build/CMakeFiles/run.dir
-C:/Users/chris/Developer/uni-ass/build/CMakeFiles/edit_cache.dir
-C:/Users/chris/Developer/uni-ass/build/CMakeFiles/rebuild_cache.dir

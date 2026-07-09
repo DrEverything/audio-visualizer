@@ -1,17 +1,14 @@
-mod bvh;
-mod types;
-mod path_tracer;
-mod rasterizer;
-mod raymarcher;
-
-use std::num::NonZeroU64;
-use std::sync::{Arc, Mutex};
+use std::num::{NonZero, NonZeroU64};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, Sender, channel};
+use std::time::Instant;
 
 use eframe::egui;
 use eframe::egui_wgpu::wgpu::util::DeviceExt;
 use eframe::egui_wgpu::{self, wgpu};
-
-use bvh::{GpuMaterial, build_scene};
+use rodio::{Decoder, MixerDeviceSink, Player, Source};
+use rustfft::{FftPlanner, num_complex::Complex};
 
 fn get_backend_from_env() -> wgpu::Backends {
     if let Ok(backend_str) = std::env::var("WGPU_BACKEND") {
@@ -25,6 +22,956 @@ fn get_backend_from_env() -> wgpu::Backends {
         }
     } else {
         wgpu::Backends::PRIMARY
+    }
+}
+
+// Struct to store persistent WGPU resources used by the shader callback
+struct VisualizerRenderResources {
+    pipeline: wgpu::RenderPipeline,
+    uniform_buffer: wgpu::Buffer,
+    audio_texture: wgpu::Texture,
+    bind_group: wgpu::BindGroup,
+    history_buffer: Vec<u8>, // RGBA8 waterfall history buffer (1024 * 256 * 4 bytes)
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct VisualizerUniforms {
+    u_time: f32,
+    u_resolution_x: f32,
+    u_resolution_y: f32,
+    u_pad: f32,
+}
+
+enum AudioMessage {
+    Decoded {
+        file_name: String,
+        samples: Arc<Vec<f32>>,
+        sample_rate: u32,
+        channels: u16,
+        playback_pos: Arc<AtomicUsize>,
+    },
+    Error(String),
+}
+
+// Custom Rodio Source that tracks the current playback position
+struct VisualizerSource {
+    samples: Arc<Vec<f32>>,
+    pos: usize,
+    sample_rate: u32,
+    channels: u16,
+    shared_pos: Arc<AtomicUsize>,
+}
+
+impl Iterator for VisualizerSource {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.pos < self.samples.len() {
+            let sample = self.samples[self.pos];
+            self.pos += 1;
+            // Update current play index
+            self.shared_pos.store(self.pos, Ordering::Relaxed);
+            Some(sample)
+        } else {
+            None
+        }
+    }
+}
+
+impl Source for VisualizerSource {
+    fn current_span_len(&self) -> Option<usize> {
+        None
+    }
+
+    fn channels(&self) -> NonZero<u16> {
+        NonZero::new(self.channels).unwrap()
+    }
+
+    fn sample_rate(&self) -> NonZero<u32> {
+        NonZero::new(self.sample_rate).unwrap()
+    }
+
+    fn total_duration(&self) -> Option<std::time::Duration> {
+        let total_samples = self.samples.len() as f64;
+        let secs = total_samples / (self.sample_rate as f64 * self.channels as f64);
+        Some(std::time::Duration::from_secs_f64(secs))
+    }
+}
+
+struct VisualizerCallback {
+    time: f32,
+    resolution: egui::Vec2,
+    samples: Vec<f32>,
+    fft_enabled: bool,
+    gain: f32,
+}
+
+impl egui_wgpu::CallbackTrait for VisualizerCallback {
+    fn prepare(
+        &self,
+        _device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        _screen_descriptor: &egui_wgpu::ScreenDescriptor,
+        _egui_encoder: &mut wgpu::CommandEncoder,
+        resources: &mut egui_wgpu::CallbackResources,
+    ) -> Vec<wgpu::CommandBuffer> {
+        if let Some(res) = resources.get_mut::<VisualizerRenderResources>() {
+            let row_size = 1024 * 4;
+            // Shift history down by 1 row (row 0 moves to row 1, etc.)
+            res.history_buffer.copy_within(0..row_size * 255, row_size);
+
+            let mut new_row = vec![0u8; row_size];
+
+            if self.fft_enabled {
+                // 1. Run 2048-point Forward FFT
+                let mut planner = FftPlanner::new();
+                let fft = planner.plan_fft_forward(2048);
+
+                let mut fft_buffer: Vec<Complex<f32>> = self
+                    .samples
+                    .iter()
+                    .map(|&s| Complex { re: s, im: 0.0 })
+                    .collect();
+
+                fft.process(&mut fft_buffer);
+
+                // 2. Map FFT bins to the new row
+                for i in 0..1024 {
+                    let c = fft_buffer[i];
+                    let magnitude = c.norm();
+
+                    // High-frequency pre-emphasis: boost higher frequency bins for visualization
+                    let freq_boost = 1.0 + (i as f32 / 128.0);
+
+                    // Apply normalized gain and scale (divide by FFT window 2048.0)
+                    let val = (magnitude / 2048.0 * self.gain * freq_boost)
+                        .sqrt()
+                        .clamp(0.0, 1.0);
+                    new_row[i * 4] = (val * 255.0) as u8; // R: FFT magnitude, 0..1
+                    let s = self.samples[i * 2];
+                    new_row[i * 4 + 1] = ((s * 0.5 + 0.5) * 255.0) as u8; // G: waveform centered at 0.5
+                    let raw = (magnitude / 2048.0 * self.gain).sqrt().clamp(0.0, 1.0);
+                    new_row[i * 4 + 2] = (raw * 255.0) as u8; // B: raw magnitude
+                    new_row[i * 4 + 3] = 255;
+                }
+            } else {
+                // Waveform Only Mode: Red contains the waveform too so the terrain reacts to it!
+                for i in 0..1024 {
+                    let s = self.samples[i * 2];
+                    // let v = ((s * 0.5 + 0.5)).clamp(0.0, 1.0);   // map -1..1 to 0..1
+                    let v = s.abs().clamp(0.0, 1.0);
+                    let byte = (v * 255.0) as u8;
+                    new_row[i * 4] = byte; // R drives terrain (rectified-ish via 0.5 center)
+                    new_row[i * 4 + 1] = byte;
+                    new_row[i * 4 + 2] = byte;
+                    new_row[i * 4 + 3] = 255;
+                }
+            }
+
+            // Copy new row to the start of history_buffer
+            res.history_buffer[0..row_size].copy_from_slice(&new_row);
+
+            // Upload the entire 1024x256 texture to the GPU
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &res.audio_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &res.history_buffer,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row_size as u32),
+                    rows_per_image: Some(256),
+                },
+                wgpu::Extent3d {
+                    width: 1024,
+                    height: 256,
+                    depth_or_array_layers: 1,
+                },
+            );
+
+            // Upload uniforms
+            let uniforms = VisualizerUniforms {
+                u_time: self.time,
+                u_resolution_x: self.resolution.x,
+                u_resolution_y: self.resolution.y,
+                u_pad: 0.0,
+            };
+            queue.write_buffer(&res.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+        }
+        Vec::new()
+    }
+
+    fn paint(
+        &self,
+        info: egui::PaintCallbackInfo,
+        render_pass: &mut wgpu::RenderPass<'static>,
+        resources: &egui_wgpu::CallbackResources,
+    ) {
+        if let Some(res) = resources.get::<VisualizerRenderResources>() {
+            render_pass.set_pipeline(&res.pipeline);
+            // Set dynamic viewport to match paint area exactly to prevent scaling issues
+            let rect = info.viewport;
+            render_pass.set_viewport(
+                rect.min.x,
+                rect.min.y,
+                rect.width(),
+                rect.height(),
+                0.0,
+                1.0,
+            );
+            render_pass.set_bind_group(0, &res.bind_group, &[]);
+            render_pass.draw(0..3, 0..1);
+        }
+    }
+}
+
+pub struct LeApp {
+    // Audio stream & Player management
+    _stream: Option<MixerDeviceSink>,
+    player: Option<Player>,
+
+    // Current playing buffer
+    current_file_name: Option<String>,
+    samples: Option<Arc<Vec<f32>>>,
+    sample_rate: u32,
+    channels: u16,
+    playback_pos: Option<Arc<AtomicUsize>>,
+
+    // Playback settings
+    volume: f32,
+    gain: f32,
+    trigger_mode: bool, // true = Lock Phase (zero-crossing search), false = continuous raw buffer
+    window_ms: f32,     // size of window to display in ms (e.g. 5ms to 150ms)
+    fft_enabled: bool,  // true = standard fourier transform landscape, false = waveform only
+
+    // Channels to communicate with background decoder thread
+    rx: Receiver<AudioMessage>,
+    tx: Sender<AudioMessage>,
+
+    // UI state
+    status_msg: String,
+    time_start: Instant,
+    is_loading: bool,
+    controls_alpha: f32, // for fading controls in/out on hover
+}
+
+impl LeApp {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Option<Self> {
+        let wgpu_render_state = cc.wgpu_render_state.as_ref()?;
+        let device = &wgpu_render_state.device;
+
+        // Compile Shader Module
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("visualizer_shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("visualizer.wgsl").into()),
+        });
+
+        // Create uniform buffer (16 bytes aligned)
+        let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("visualizer_uniforms"),
+            contents: bytemuck::cast_slice(&[0.0_f32; 4]),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::UNIFORM,
+        });
+
+        // Create audio texture (1024x256, Rgba8Unorm format)
+        let audio_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("audio_texture"),
+            size: wgpu::Extent3d {
+                width: 1024,
+                height: 256,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+
+        let audio_texture_view = audio_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // Create linear sampler matching Shadertoy audio channel settings.
+        // Shadertoy's iChannel audio texture wraps (Repeat) by default. The horizontal
+        // coordinate (p.x + 4.5) / 30.0 goes negative on the left side of the screen; with
+        // ClampToEdge that pins to column 0 and extrudes the loudest (bass/first) bin into a
+        // tall flat wall on high peaks, which raymarches into bright streak artifacts. Repeat
+        // wraps those out-of-range samples to the quiet high end instead, matching the original.
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("audio_sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+
+        // Bind Group Layout
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("visualizer_bind_group_layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: NonZeroU64::new(16),
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
+        // Pipeline Layout
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("visualizer_pipeline_layout"),
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
+        });
+
+        // Render Pipeline
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("visualizer_pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu_render_state.target_format.into())],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        // Bind Group
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("visualizer_bind_group"),
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&audio_texture_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
+        });
+
+        // Initialize history_buffer with silent values
+        let mut history_buffer = vec![0u8; 1024 * 256 * 4];
+        for y in 0..256 {
+            for x in 0..1024 {
+                let idx = (y * 1024 + x) * 4;
+                history_buffer[idx] = 0; // Red (silent baseline)
+                history_buffer[idx + 1] = 128; // Green (silent baseline)
+                history_buffer[idx + 2] = 0; // Blue (silent baseline)
+                history_buffer[idx + 3] = 255; // Alpha (opaque Snorm)
+            }
+        }
+
+        // Insert resources so the callback can retrieve them later
+        wgpu_render_state
+            .renderer
+            .write()
+            .callback_resources
+            .insert(VisualizerRenderResources {
+                pipeline,
+                uniform_buffer,
+                audio_texture,
+                bind_group,
+                history_buffer,
+            });
+
+        // Try to setup Audio device using new rodio 0.22 API
+        let stream = match rodio::stream::DeviceSinkBuilder::open_default_sink() {
+            Ok(s) => Some(s),
+            Err(e) => {
+                log::warn!("Audio device not found/ready: {}", e);
+                None
+            }
+        };
+
+        let player = if let Some(ref s) = stream {
+            let mixer = s.mixer();
+            Some(Player::connect_new(&mixer))
+        } else {
+            None
+        };
+
+        let (tx, rx) = channel();
+
+        // Load persisted settings if available
+        let volume = cc.storage
+            .and_then(|s| eframe::get_value(s, "volume"))
+            .unwrap_or(0.5);
+        let gain = cc.storage
+            .and_then(|s| eframe::get_value(s, "gain"))
+            .unwrap_or(8.0);
+        let trigger_mode = cc.storage
+            .and_then(|s| eframe::get_value(s, "trigger_mode"))
+            .unwrap_or(true);
+        let window_ms = cc.storage
+            .and_then(|s| eframe::get_value(s, "window_ms"))
+            .unwrap_or(150.0);
+        let fft_enabled = cc.storage
+            .and_then(|s| eframe::get_value(s, "fft_enabled"))
+            .unwrap_or(true);
+
+        Some(Self {
+            _stream: stream,
+            player,
+            current_file_name: None,
+            samples: None,
+            sample_rate: 44100,
+            channels: 2,
+            playback_pos: None,
+            volume,
+            gain,
+            trigger_mode,
+            window_ms,
+            fft_enabled,
+            rx,
+            tx,
+            status_msg: "Drag & Drop an audio file (MP3, WAV, FLAC, OGG) here to play!".to_string(),
+            time_start: Instant::now(),
+            is_loading: false,
+            controls_alpha: 0.0,
+        })
+    }
+}
+
+fn decode_audio_file(
+    path: &std::path::Path,
+) -> Result<(Vec<f32>, u32, u16), Box<dyn std::error::Error + Send + Sync>> {
+    use std::fs::File;
+    use std::io::BufReader;
+
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let source = Decoder::new(reader)?;
+
+    let sample_rate: u32 = source.sample_rate().get();
+    let channels: u16 = source.channels().get();
+
+    // In rodio 0.22, Decoder yields f32 directly
+    let samples: Vec<f32> = source.collect();
+
+    Ok((samples, sample_rate, channels))
+}
+
+impl eframe::App for LeApp {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx();
+        ctx.set_visuals(egui::Visuals::dark());
+
+
+
+        // Process message from audio decoder thread
+        if let Ok(msg) = self.rx.try_recv() {
+            self.is_loading = false;
+            match msg {
+                AudioMessage::Decoded {
+                    file_name,
+                    samples,
+                    sample_rate,
+                    channels,
+                    playback_pos,
+                } => {
+                    self.current_file_name = Some(file_name.clone());
+                    self.samples = Some(samples.clone());
+                    self.sample_rate = sample_rate;
+                    self.channels = channels;
+                    self.playback_pos = Some(playback_pos.clone());
+                    self.status_msg = format!(
+                        "Playing: {} ({}Hz, {} channels)",
+                        file_name, sample_rate, channels
+                    );
+
+                    // Stop previous sound and close stream/sink
+                    if let Some(ref player) = self.player {
+                        player.stop();
+                    }
+                    self.player = None;
+                    self._stream = None;
+
+                    // Re-create the stream and player with the new sample rate and channels
+                    let new_stream = if let (Some(rate), Some(ch)) = (NonZero::new(sample_rate), NonZero::new(channels)) {
+                        if let Ok(builder) = rodio::stream::DeviceSinkBuilder::from_default_device() {
+                            let builder = builder.with_sample_rate(rate).with_channels(ch);
+                            builder.open_sink_or_fallback().ok()
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                    // Fallback to default sink if custom configuration failed
+                    let new_stream = new_stream.or_else(|| {
+                        rodio::stream::DeviceSinkBuilder::open_default_sink().ok()
+                    });
+
+                    if let Some(s) = new_stream {
+                        let mixer = s.mixer();
+                        let new_player = Player::connect_new(&mixer);
+                        new_player.set_volume(self.volume);
+                        
+                        let source = VisualizerSource {
+                            samples: samples.clone(),
+                            pos: 0,
+                            sample_rate,
+                            channels,
+                            shared_pos: playback_pos.clone(),
+                        };
+                        new_player.append(source);
+                        new_player.play();
+
+                        self.player = Some(new_player);
+                        self._stream = Some(s);
+                    } else {
+                        self.status_msg =
+                            "No audio output device found (Visualizer only mode).".to_string();
+                    }
+                }
+                AudioMessage::Error(err) => {
+                    self.status_msg = format!("Decoding error: {}", err);
+                }
+            }
+        }
+
+        // Process dropped file events
+        if !ctx.input(|i| i.raw.dropped_files.is_empty()) {
+            let dropped_files = ctx.input(|i| i.raw.dropped_files.clone());
+            for file in dropped_files {
+                if let Some(path) = file.path {
+                    self.is_loading = true;
+                    self.status_msg = format!(
+                        "Decoding {}...",
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                    );
+
+                    let tx = self.tx.clone();
+                    std::thread::spawn(move || match decode_audio_file(&path) {
+                        Ok((samples, sample_rate, channels)) => {
+                            let playback_pos = Arc::new(AtomicUsize::new(0));
+                            let _ = tx.send(AudioMessage::Decoded {
+                                file_name: path
+                                    .file_name()
+                                    .unwrap_or_default()
+                                    .to_string_lossy()
+                                    .into_owned(),
+                                samples: Arc::new(samples),
+                                sample_rate,
+                                channels,
+                                playback_pos,
+                            });
+                        }
+                        Err(e) => {
+                            let _ = tx.send(AudioMessage::Error(e.to_string()));
+                        }
+                    });
+                }
+            }
+        }
+
+        // Fallback simulation mode if no audio output device is present
+        if self.player.is_none() && self.samples.is_some() {
+            if let (Some(samples), Some(playback_pos)) = (&self.samples, &self.playback_pos) {
+                let dt = ctx.input(|i| i.stable_dt);
+                let samples_to_advance =
+                    (dt * self.sample_rate as f32 * self.channels as f32) as usize;
+                let current = playback_pos.load(Ordering::Relaxed);
+                let new_pos = (current + samples_to_advance).min(samples.len());
+                playback_pos.store(new_pos, Ordering::Relaxed);
+            }
+        }
+
+        // Get full UI rect
+        let rect = ui.max_rect();
+        let time = self.time_start.elapsed().as_secs_f32();
+
+        // Extract and trigger audio samples to write to visualizer (2048 samples window)
+        let mut visualizer_samples = vec![0.0f32; 2048];
+        if let (Some(samples), Some(playback_pos)) = (&self.samples, &self.playback_pos) {
+            let current_idx = playback_pos.load(Ordering::Relaxed);
+            let total_samples = samples.len();
+            let total_frames = total_samples / (self.channels as usize);
+            let current_frame = current_idx / (self.channels as usize);
+
+            // Compute total frames in the zoom window
+            let window_frames = ((self.window_ms / 1000.0) * self.sample_rate as f32) as usize;
+            let window_frames = window_frames.max(32); // at least 32 frames for 2048 window
+
+            let mut start_frame = current_frame;
+
+            if self.trigger_mode {
+                // Stabilize wave phase via Oscilloscope Rising-Edge Zero-Crossing Triggering.
+                // We search ahead for a zero-crossing based on mono mixed values.
+                let search_len = 1024.min(total_frames.saturating_sub(current_frame));
+                for f in 0..search_len {
+                    let f_idx = current_frame + f;
+
+                    let mut v1 = 0.0;
+                    let mut count = 0;
+                    for c in 0..(self.channels as usize) {
+                        let idx = f_idx * (self.channels as usize) + c;
+                        if idx < total_samples {
+                            v1 += samples[idx];
+                            count += 1;
+                        }
+                    }
+                    let mono1 = if count > 0 { v1 / count as f32 } else { 0.0 };
+
+                    let mut v2 = 0.0;
+                    let mut count2 = 0;
+                    for c in 0..(self.channels as usize) {
+                        let idx = (f_idx + 1) * (self.channels as usize) + c;
+                        if idx < total_samples {
+                            v2 += samples[idx];
+                            count2 += 1;
+                        }
+                    }
+                    let mono2 = if count2 > 0 { v2 / count2 as f32 } else { 0.0 };
+
+                    if mono1 < 0.0 && mono2 >= 0.0 {
+                        start_frame = f_idx;
+                        break;
+                    }
+                }
+            }
+
+            // Downsample/interpolate the window down to 2048 samples
+            for i in 0..2048 {
+                let frame_offset = (i * window_frames) / 2048;
+                let target_frame = start_frame + frame_offset;
+
+                let mut sum = 0.0;
+                let mut count = 0;
+                for c in 0..(self.channels as usize) {
+                    let idx = target_frame * (self.channels as usize) + c;
+                    if idx < total_samples {
+                        sum += samples[idx];
+                        count += 1;
+                    }
+                }
+                visualizer_samples[i] = if count > 0 { sum / count as f32 } else { 0.0 };
+            }
+        }
+
+        // Draw visualizer shader. Pass accurate painting rectangle size to ensure pixel scaling matching.
+        let paint_rect = rect;
+        ui.painter().add(egui_wgpu::Callback::new_paint_callback(
+            paint_rect,
+            VisualizerCallback {
+                time,
+                resolution: paint_rect.size(),
+                samples: visualizer_samples,
+                fft_enabled: self.fft_enabled,
+                gain: self.gain,
+            },
+        ));
+
+        // Force repaint to animate shader
+        ctx.request_repaint();
+
+        // Calculate floating overlay parameters
+        let screen_w = rect.width();
+        let control_w = (screen_w * 0.82).clamp(500.0, 1050.0);
+        let control_h = 130.0;
+
+        let overlay_pos = egui::pos2(
+            rect.left() + (screen_w - control_w) * 0.5,
+            rect.bottom() - control_h - 20.0,
+        );
+
+        let overlay_rect = egui::Rect::from_min_size(overlay_pos, egui::vec2(control_w, control_h));
+
+        // Show controls only if the pointer is inside the bottom control panel region
+        let show_controls = if let Some(hover_pos) = ctx.input(|i| i.pointer.hover_pos()) {
+            overlay_rect.contains(hover_pos) || hover_pos.y > rect.bottom() - 150.0
+        } else {
+            false
+        };
+
+        // Smooth fade transition
+        let dt = ctx.input(|i| i.stable_dt).min(0.1);
+        let target_alpha = if show_controls { 1.0 } else { 0.0 };
+        self.controls_alpha += (target_alpha - self.controls_alpha) * 8.0 * dt;
+        self.controls_alpha = self.controls_alpha.clamp(0.0, 1.0);
+
+        // Render controls panel only if it's visible
+        if self.controls_alpha > 0.001 {
+            egui::Area::new(egui::Id::new("controls"))
+                .fixed_pos(overlay_pos)
+                .show(ctx, |ui| {
+                    ui.set_width(control_w);
+                    ui.set_height(control_h);
+                    ui.set_opacity(self.controls_alpha);
+
+                    egui::Frame::new()
+                        .fill(egui::Color32::from_black_alpha(190))
+                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_white_alpha(30)))
+                        .corner_radius(egui::CornerRadius::same(16))
+                        .inner_margin(16.0)
+                        .show(ui, |ui| {
+                            // Status Row
+                            ui.horizontal(|ui| {
+                                if self.is_loading {
+                                    ui.add(egui::Spinner::new().size(14.0));
+                                    ui.add_space(6.0);
+                                }
+                                ui.label(
+                                    egui::RichText::new(&self.status_msg)
+                                        .color(egui::Color32::WHITE)
+                                        .font(egui::FontId::proportional(13.0)),
+                                );
+                            });
+
+                            ui.add_space(8.0);
+
+                            // Progress / Seeking Row
+                            let mut total_duration_secs = 0.0;
+                            let mut current_secs = 0.0;
+
+                            if let (Some(samples), Some(playback_pos)) =
+                                (&self.samples, &self.playback_pos)
+                            {
+                                let current_idx = playback_pos.load(Ordering::Relaxed);
+                                let total_samples = samples.len();
+                                total_duration_secs = total_samples as f32
+                                    / (self.sample_rate as f32 * self.channels as f32);
+                                current_secs = current_idx as f32
+                                    / (self.sample_rate as f32 * self.channels as f32);
+                            }
+
+                            let mut seek_to_secs = current_secs;
+                            ui.horizontal(|ui| {
+                                ui.style_mut().spacing.slider_width = control_w - 180.0;
+                                if total_duration_secs > 0.0 {
+                                    let current_time_str = format!(
+                                        "{:02}:{:02}",
+                                        (current_secs / 60.0) as i32,
+                                        (current_secs % 60.0) as i32
+                                    );
+                                    let total_time_str = format!(
+                                        "{:02}:{:02}",
+                                        (total_duration_secs / 60.0) as i32,
+                                        (total_duration_secs % 60.0) as i32
+                                    );
+
+                                    ui.label(
+                                        egui::RichText::new(current_time_str)
+                                            .color(egui::Color32::LIGHT_GRAY),
+                                    );
+                                    let slider = egui::Slider::new(
+                                        &mut seek_to_secs,
+                                        0.0..=total_duration_secs,
+                                    )
+                                    .show_value(false);
+                                    let response = ui.add(slider);
+                                    ui.label(
+                                        egui::RichText::new(total_time_str)
+                                            .color(egui::Color32::LIGHT_GRAY),
+                                    );
+
+                                    if response.changed() {
+                                        let target_sample_idx = (seek_to_secs
+                                            * self.sample_rate as f32
+                                            * self.channels as f32)
+                                            as usize;
+                                        if let Some(ref samples) = self.samples {
+                                            let target_sample_idx =
+                                                target_sample_idx.min(samples.len());
+                                            if let Some(ref player) = self.player {
+                                                player.stop();
+                                                let new_playback_pos =
+                                                    Arc::new(AtomicUsize::new(target_sample_idx));
+                                                self.playback_pos = Some(new_playback_pos.clone());
+                                                let source = VisualizerSource {
+                                                    samples: samples.clone(),
+                                                    pos: target_sample_idx,
+                                                    sample_rate: self.sample_rate,
+                                                    channels: self.channels,
+                                                    shared_pos: new_playback_pos,
+                                                };
+                                                player.append(source);
+                                                player.play();
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    ui.add_enabled(
+                                        false,
+                                        egui::Slider::new(&mut seek_to_secs, 0.0..=1.0)
+                                            .show_value(false),
+                                    );
+                                }
+                            });
+
+                            ui.add_space(8.0);
+
+                            // Media Control Row
+                            ui.horizontal(|ui| {
+                                let is_playing = self.player.as_ref().map_or(false, |p| {
+                                    !p.is_paused()
+                                        && self.playback_pos.as_ref().map_or(false, |pos| {
+                                            pos.load(Ordering::Relaxed)
+                                                < self.samples.as_ref().map_or(0, |s| s.len())
+                                        })
+                                });
+
+                                // Play/Pause Button
+                                if is_playing {
+                                    if ui.button(egui::RichText::new("⏸").size(16.0)).clicked() {
+                                        if let Some(ref player) = self.player {
+                                            player.pause();
+                                        }
+                                    }
+                                } else {
+                                    let can_play = self.samples.is_some();
+                                    if ui
+                                        .add_enabled(
+                                            can_play,
+                                            egui::Button::new(egui::RichText::new("▶").size(16.0)),
+                                        )
+                                        .clicked()
+                                    {
+                                        if let Some(ref player) = self.player {
+                                            let current = self
+                                                .playback_pos
+                                                .as_ref()
+                                                .map_or(0, |pos| pos.load(Ordering::Relaxed));
+                                            let total =
+                                                self.samples.as_ref().map_or(0, |s| s.len());
+                                            if current >= total {
+                                                player.stop();
+                                                let new_playback_pos =
+                                                    Arc::new(AtomicUsize::new(0));
+                                                self.playback_pos = Some(new_playback_pos.clone());
+                                                let source = VisualizerSource {
+                                                    samples: self.samples.as_ref().unwrap().clone(),
+                                                    pos: 0,
+                                                    sample_rate: self.sample_rate,
+                                                    channels: self.channels,
+                                                    shared_pos: new_playback_pos,
+                                                };
+                                                player.append(source);
+                                            }
+                                            player.play();
+                                        }
+                                    }
+                                }
+
+                                // Stop Button
+                                if ui
+                                    .add_enabled(
+                                        self.samples.is_some(),
+                                        egui::Button::new(egui::RichText::new("⏹").size(16.0)),
+                                    )
+                                    .clicked()
+                                {
+                                    if let Some(ref player) = self.player {
+                                        player.stop();
+                                    }
+                                    if let Some(ref p) = self.playback_pos {
+                                        p.store(0, Ordering::Relaxed);
+                                    }
+                                }
+
+                                ui.separator();
+
+                                // Volume Slider
+                                ui.label("🔊");
+                                let mut vol = self.volume;
+                                ui.style_mut().spacing.slider_width = 80.0;
+                                if ui
+                                    .add(egui::Slider::new(&mut vol, 0.0..=1.0).show_value(false))
+                                    .changed()
+                                {
+                                    self.volume = vol;
+                                    if let Some(ref player) = self.player {
+                                        player.set_volume(vol);
+                                    }
+                                }
+
+                                ui.separator();
+
+                                // Waveform Visual Gain Slider
+                                ui.label("Gain:");
+                                ui.style_mut().spacing.slider_width = 80.0;
+                                ui.add(
+                                    egui::Slider::new(&mut self.gain, 0.1..=8.0).show_value(true),
+                                );
+
+                                ui.separator();
+
+                                // Visual Mode Toggle (FFT vs Waveform)
+                                ui.checkbox(&mut self.fft_enabled, "Standard (FFT + Wave)");
+
+                                ui.separator();
+
+                                // Phase Lock Checkbox
+                                ui.checkbox(&mut self.trigger_mode, "Lock Phase");
+
+                                ui.separator();
+
+                                // Window Zoom Slider
+                                ui.label("Window:");
+                                ui.style_mut().spacing.slider_width = 80.0;
+                                ui.add(
+                                    egui::Slider::new(&mut self.window_ms, 5.0..=150.0)
+                                        .suffix("ms"),
+                                );
+                            });
+                        });
+                });
+        }
+    }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        eframe::set_value(storage, "volume", &self.volume);
+        eframe::set_value(storage, "gain", &self.gain);
+        eframe::set_value(storage, "trigger_mode", &self.trigger_mode);
+        eframe::set_value(storage, "window_ms", &self.window_ms);
+        eframe::set_value(storage, "fft_enabled", &self.fft_enabled);
     }
 }
 
@@ -45,15 +992,13 @@ fn main() -> eframe::Result {
                 display_handle: None,
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 native_adapter_selector: None,
-                device_descriptor: std::sync::Arc::new(|_adapter| {
-                    wgpu::DeviceDescriptor {
-                        label: Some("egui wgpu device"),
-                        required_features: wgpu::Features::empty(),
-                        required_limits: wgpu::Limits::default(),
-                        experimental_features: wgpu::ExperimentalFeatures::disabled(),
-                        memory_hints: wgpu::MemoryHints::default(),
-                        trace: wgpu::Trace::Off,
-                    }
+                device_descriptor: std::sync::Arc::new(|_adapter| wgpu::DeviceDescriptor {
+                    label: Some("egui wgpu device"),
+                    required_features: wgpu::Features::empty(),
+                    required_limits: wgpu::Limits::default(),
+                    experimental_features: wgpu::ExperimentalFeatures::disabled(),
+                    memory_hints: wgpu::MemoryHints::default(),
+                    trace: wgpu::Trace::Off,
                 }),
             }),
             ..Default::default()
@@ -61,1130 +1006,19 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 800.0])
             .with_resizable(true)
-            .with_title("Physically Accurate GPU Path Tracer"),
+            .with_title("Audio Wave Visualizer"),
         ..Default::default()
     };
 
     eframe::run_native(
-        "Physically Accurate GPU Path Tracer",
+        "Audio Wave Visualizer",
         native_options,
-        Box::new(|cc| {
-            match RaymarchApp::new(cc) {
-                Some(app) => Ok(Box::new(app)),
-                None => {
-                    log::error!("Failed to initialize WGPU renderer.");
-                    Err("WGPU renderer initialization failed".into())
-                }
+        Box::new(|cc| match LeApp::new(cc) {
+            Some(app) => Ok(Box::new(app)),
+            None => {
+                log::error!("Failed to initialize WGPU renderer.");
+                Err("WGPU renderer initialization failed".into())
             }
         }),
     )
-}
-
-struct MaterialParams {
-    name: String,
-    base_color: [f32; 3],
-    metallic: f32,
-    roughness: f32,
-    ior: f32,
-    transmission: f32,
-    emissive: [f32; 3],
-}
-
-impl MaterialParams {
-    fn to_gpu(&self) -> GpuMaterial {
-        GpuMaterial {
-            base_color: [self.base_color[0], self.base_color[1], self.base_color[2], self.metallic],
-            properties: [self.roughness, self.ior, self.transmission, 0.0],
-            emissive: [self.emissive[0], self.emissive[1], self.emissive[2], 0.0],
-        }
-    }
-}
-
-pub trait Renderer: Send + Sync {
-    fn name(&self) -> &'static str;
-    
-    fn prepare(
-        &self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        uniforms: &PathTraceUniforms,
-        shared: &SharedRenderResources,
-        target_view: &wgpu::TextureView,
-        bind_group_pt: &wgpu::BindGroup,
-    ) -> Vec<wgpu::CommandBuffer>;
-
-    fn check_reload(
-        &mut self,
-        device: &wgpu::Device,
-        render_state: &eframe::egui_wgpu::RenderState,
-    ) -> bool;
-
-    fn error(&self) -> Option<&str>;
-
-    fn draw_ui(&mut self, ui: &mut egui::Ui) -> bool;
-
-    fn update_uniforms(&self, uniforms: &mut PathTraceUniforms);
-
-    fn supports_accumulation(&self) -> bool {
-        false
-    }
-
-    fn max_accumulation_frames(&self) -> u32 {
-        1
-    }
-
-    fn reset_defaults(&mut self) {}
-}
-
-struct RendererVector {
-    renderers: Arc<Mutex<Vec<Box<dyn Renderer>>>>,
-}
-
-#[derive(Clone)]
-pub struct SharedRenderResources {
-    pub bind_group_layout: wgpu::BindGroupLayout,
-    pub display_bind_group_layout: wgpu::BindGroupLayout,
-    pub uniform_buffer: wgpu::Buffer,
-    pub vertex_buffer: wgpu::Buffer,
-    pub index_buffer: wgpu::Buffer,
-    pub tri_material_buffer: wgpu::Buffer,
-    pub material_buffer: wgpu::Buffer,
-    pub bvh_buffer: wgpu::Buffer,
-    pub sampler: wgpu::Sampler,
-    pub textures: Arc<Mutex<Option<AccumTextures>>>,
-    pub display_pipeline: wgpu::RenderPipeline,
-}
-
-struct RaymarchApp {
-    renderers: Arc<Mutex<Vec<Box<dyn Renderer>>>>,
-    selected_renderer_idx: usize,
-
-    // Animation control parameters
-    animate: bool,
-    auto_rotate_camera: bool,
-    animation_speed: f32,
-    time: f32,
-
-    // Materials list
-    materials: Vec<MaterialParams>,
-    selected_material_idx: usize,
-
-    // Camera settings
-    camera_rot: [f32; 2], // yaw, pitch
-    camera_zoom: f32,
-    prev_camera_rot: [f32; 2],
-    prev_camera_zoom: f32,
-
-    // Accumulation stats
-    frame_index: u32,
-    accum_frame: u32,
-    wgpu_initialized: bool,
-
-    // Scene geometry offsets
-    bvh_offsets: [u32; 4],
-    tri_offsets: [u32; 4],
-
-    // Frame-by-frame convergence
-    render_frame_by_frame: bool,
-    fps: f32,
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct PathTraceUniforms {
-    pub resolution: [f32; 2],
-    pub camera_rot: [f32; 2],
-    pub camera_zoom: f32,
-    pub frame_index: u32,
-    pub max_depth: u32,
-    pub samples_per_frame: u32,
-    pub aperture: f32,
-    pub focal_distance: f32,
-    pub env_light_intensity: f32,
-    pub prev_camera_zoom: f32,
-    pub prev_camera_rot: [f32; 2],
-    pub time: f32,
-    pub accum_frame: u32,
-    pub bvh_offsets: [u32; 4],
-    pub tri_offsets: [u32; 4],
-    pub dt: f32,
-    pub render_mode: u32,  // 0 = PathTracer, 1 = Deferred, 2 = Raymarcher
-    pub tonemap_mode: u32, // 0 = Reinhard, 1 = ACES
-    pub _pad_align2: u32,
-}
-
-impl RaymarchApp {
-    pub fn new<'a>(cc: &'a eframe::CreationContext<'a>) -> Option<Self> {
-        let wgpu_render_state = cc.wgpu_render_state.as_ref()?;
-        let device = &wgpu_render_state.device;
-
-        // 1. Build Scene (Vertices, Indices, Material mapping, and BVH)
-        let (
-            vertices,
-            indices,
-            tri_materials,
-            bvh_nodes,
-            bvh_offsets,
-            tri_offsets,
-        ) = build_scene();
-        log::info!("Scene built with {} vertices, {} triangles, {} BVH nodes.", 
-                  vertices.len(), indices.len() / 3, bvh_nodes.len());
-
-        // 2. Initialize Material definitions
-        let materials = vec![
-            MaterialParams {
-                name: "Left Wall (Red)".to_string(),
-                base_color: [0.75, 0.15, 0.15],
-                metallic: 0.0,
-                roughness: 0.8,
-                ior: 1.5,
-                transmission: 0.0,
-                emissive: [0.0; 3],
-            },
-            MaterialParams {
-                name: "Right Wall (Green)".to_string(),
-                base_color: [0.15, 0.75, 0.15],
-                metallic: 0.0,
-                roughness: 0.8,
-                ior: 1.5,
-                transmission: 0.0,
-                emissive: [0.0; 3],
-            },
-            MaterialParams {
-                name: "Walls/Floor (White)".to_string(),
-                base_color: [0.75, 0.75, 0.75],
-                metallic: 0.0,
-                roughness: 0.8,
-                ior: 1.5,
-                transmission: 0.0,
-                emissive: [0.0; 3],
-            },
-            MaterialParams {
-                name: "Ceiling Light".to_string(),
-                base_color: [0.75, 0.75, 0.75],
-                metallic: 0.0,
-                roughness: 0.8,
-                ior: 1.5,
-                transmission: 0.0,
-                emissive: [12.0, 12.0, 12.0],
-            },
-            MaterialParams {
-                name: "Mechanical Part / Torus".to_string(),
-                base_color: [0.91, 0.92, 0.92],
-                metallic: 1.0,
-                roughness: 0.15,
-                ior: 1.5,
-                transmission: 0.0,
-                emissive: [0.0; 3],
-            },
-            MaterialParams {
-                name: "Gold Sphere".to_string(),
-                base_color: [1.0, 0.78, 0.34],
-                metallic: 1.0,
-                roughness: 0.05,
-                ior: 1.5,
-                transmission: 0.0,
-                emissive: [0.0; 3],
-            },
-            MaterialParams {
-                name: "Glass Sphere".to_string(),
-                base_color: [0.95, 0.95, 0.95],
-                metallic: 0.0,
-                roughness: 0.0,
-                ior: 1.5,
-                transmission: 1.0,
-                emissive: [0.0; 3],
-            },
-        ];
-
-        let gpu_materials: Vec<GpuMaterial> = materials.iter().map(|m| m.to_gpu()).collect();
-
-        // Compile display shader
-        let display_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("display_shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("./display.wgsl").into()),
-        });
-
-        // Create GPU storage and uniform buffers
-        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("uniform_buffer"),
-            size: std::mem::size_of::<PathTraceUniforms>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("vertex_buffer"),
-            contents: bytemuck::cast_slice(&vertices),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-
-        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("index_buffer"),
-            contents: bytemuck::cast_slice(&indices),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-
-        let tri_material_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("tri_material_buffer"),
-            contents: bytemuck::cast_slice(&tri_materials),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-
-        let material_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("material_buffer"),
-            contents: bytemuck::cast_slice(&gpu_materials),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        });
-
-        let bvh_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("bvh_buffer"),
-            contents: bytemuck::cast_slice(&bvh_nodes),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("nearest_sampler"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
-            ..Default::default()
-        });
-
-        // 3. Create Bind Group Layouts
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("bind_group_layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4,
-                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 5,
-                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 6,
-                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 7,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-            ],
-        });
-
-        let display_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("display_bind_group_layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
-                    count: None,
-                },
-            ],
-        });
-
-        let pt_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("pt_pipeline_layout"),
-            bind_group_layouts: &[Some(&bind_group_layout)],
-            immediate_size: 0,
-        });
-
-        let disp_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("disp_pipeline_layout"),
-            bind_group_layouts: &[Some(&display_bind_group_layout)],
-            immediate_size: 0,
-        });
-
-        // Create Display Render Pipeline
-        // Target format matches egui's viewport format
-        let display_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("display_pipeline"),
-            layout: Some(&disp_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &display_shader,
-                entry_point: Some("vs_main"),
-                buffers: &[],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &display_shader,
-                entry_point: Some("fs_display"),
-                targets: &[Some(wgpu_render_state.target_format.into())],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
-
-        let shared_resources = SharedRenderResources {
-            bind_group_layout,
-            display_bind_group_layout,
-            uniform_buffer,
-            vertex_buffer,
-            index_buffer,
-            tri_material_buffer,
-            material_buffer,
-            bvh_buffer,
-            sampler,
-            textures: Arc::new(Mutex::new(None)),
-            display_pipeline,
-        };
-
-        // Create modular renderers
-        let renderers: Vec<Box<dyn Renderer>> = vec![
-            Box::new(path_tracer::PathTracer::new(device, &pt_pipeline_layout)),
-            Box::new(rasterizer::Rasterizer::new(device, &pt_pipeline_layout)),
-            Box::new(raymarcher::Raymarcher::new(device, &pt_pipeline_layout)),
-        ];
-
-        let renderers_arc = Arc::new(Mutex::new(renderers));
-
-        wgpu_render_state
-            .renderer
-            .write()
-            .callback_resources
-            .insert(shared_resources.clone());
-
-        wgpu_render_state
-            .renderer
-            .write()
-            .callback_resources
-            .insert(RendererVector {
-                renderers: renderers_arc.clone(),
-            });
-
-        Some(Self {
-            renderers: renderers_arc,
-            selected_renderer_idx: 2,
-            animate: false,
-            auto_rotate_camera: false,
-            animation_speed: 1.0,
-            time: 0.0,
-            materials,
-            selected_material_idx: 4, // default to Mechanical Part
-            camera_rot: [0.0, 0.3],
-            camera_zoom: 5.5,
-            prev_camera_rot: [0.0, 0.3],
-            prev_camera_zoom: 5.5,
-            frame_index: 0,
-            accum_frame: 0,
-            wgpu_initialized: true,
-            bvh_offsets,
-            tri_offsets,
-            render_frame_by_frame: false,
-            fps: 30.0,
-        })
-    }
-}
-
-impl eframe::App for RaymarchApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let ctx = ui.ctx();
-        if !self.wgpu_initialized {
-            egui::CentralPanel::default().show(ui, |ui| {
-                ui.centered_and_justified(|ui| {
-                    ui.heading("WGPU renderer failed to initialize.");
-                });
-            });
-            return;
-        }
-
-        // Check for shader file changes for hot reloading
-        if let Some(render_state) = _frame.wgpu_render_state() {
-            let mut renderers = self.renderers.lock().unwrap();
-            if let Some(renderer) = renderers.get_mut(self.selected_renderer_idx) {
-                if renderer.check_reload(&render_state.device, render_state) {
-                    self.accum_frame = 0;
-                }
-            }
-        }
-
-        // Continually request repaint if animating or if we have not reached max convergence
-        let need_repaint = {
-            let renderers = self.renderers.lock().unwrap();
-            let active_renderer = &renderers[self.selected_renderer_idx];
-            self.animate
-                || self.auto_rotate_camera
-                || (active_renderer.supports_accumulation() && self.accum_frame < active_renderer.max_accumulation_frames())
-        };
-        if need_repaint {
-            ctx.request_repaint();
-        }
-
-        // Control Panel Sidebar
-        egui::Panel::left("pt_control_panel")
-            .resizable(true)
-            .default_size(340.0)
-            .show(ui, |ui| {
-                ui.add_space(10.0);
-                ui.heading("Render Mode Controls");
-                ui.add_space(15.0);
-
-                let active_error = {
-                    let renderers = self.renderers.lock().unwrap();
-                    renderers[self.selected_renderer_idx].error().map(|e| e.to_string())
-                };
-
-                if let Some(ref err) = active_error {
-                    ui.group(|ui| {
-                        ui.colored_label(egui::Color32::LIGHT_RED, "❌ Shader Compilation Error:");
-                        egui::ScrollArea::vertical().max_height(100.0).show(ui, |ui| {
-                            ui.weak(err);
-                        });
-                    });
-                    ui.add_space(10.0);
-                }
-
-                // Render Mode Selection
-                ui.group(|ui| {
-                    ui.label("Rendering Approach:");
-                    let prev_idx = self.selected_renderer_idx;
-                    ui.horizontal(|ui| {
-                        let renderers = self.renderers.lock().unwrap();
-                        for (idx, r) in renderers.iter().enumerate() {
-                            ui.selectable_value(&mut self.selected_renderer_idx, idx, r.name());
-                        }
-                    });
-                    if self.selected_renderer_idx != prev_idx {
-                        self.accum_frame = 0;
-                    }
-                });
-                ui.add_space(10.0);
-
-                // Ray stats
-                let supports_accum = {
-                    let renderers = self.renderers.lock().unwrap();
-                    renderers[self.selected_renderer_idx].supports_accumulation()
-                };
-                if supports_accum {
-                    let max_accum = {
-                        let renderers = self.renderers.lock().unwrap();
-                        renderers[self.selected_renderer_idx].max_accumulation_frames()
-                    };
-                    ui.group(|ui| {
-                        ui.label(format!("Accumulated Frames: {} / {}", self.accum_frame, max_accum));
-                        if ui.button("Reset Accumulation").clicked() {
-                            self.accum_frame = 0;
-                        }
-                    });
-                    ui.add_space(10.0);
-                }
-
-                // Active Renderer Specific controls
-                let mut renderer_changed = false;
-                {
-                    let mut renderers = self.renderers.lock().unwrap();
-                    if let Some(r) = renderers.get_mut(self.selected_renderer_idx) {
-                        renderer_changed = r.draw_ui(ui);
-                    }
-                }
-                if renderer_changed {
-                    self.accum_frame = 0;
-                }
-                ui.add_space(10.0);
-
-                // Animation Controls
-                ui.group(|ui| {
-                    ui.label("Animation Controls");
-                    let mut anim_changed = false;
-                    if ui.checkbox(&mut self.animate, "Animate Objects").changed() {
-                        anim_changed = true;
-                    }
-                    if ui.checkbox(&mut self.auto_rotate_camera, "Auto-rotate Camera").changed() {
-                        anim_changed = true;
-                    }
-                    ui.add(egui::Slider::new(&mut self.animation_speed, 0.1..=4.0).text("Speed Multiplier"));
-                    if ui.checkbox(&mut self.render_frame_by_frame, "Frame-by-Frame Convergence").changed() {
-                        anim_changed = true;
-                    }
-                    if self.render_frame_by_frame {
-                        if ui.add(egui::Slider::new(&mut self.fps, 10.0..=60.0).text("FPS")).changed() {
-                            anim_changed = true;
-                        }
-                    }
-                    if ui.button("Reset Time").clicked() {
-                        self.time = 0.0;
-                        self.accum_frame = 0;
-                    }
-                    if anim_changed {
-                        self.accum_frame = 0;
-                    }
-                });
-                ui.add_space(10.0);
-
-                // Interactive Material Editor
-                ui.group(|ui| {
-                    ui.label("Interactive Material Editor");
-                    
-                    let prev_idx = self.selected_material_idx;
-                    egui::ComboBox::from_label("Selected Material")
-                        .selected_text(&self.materials[self.selected_material_idx].name)
-                        .show_ui(ui, |ui| {
-                            for (idx, mat) in self.materials.iter().enumerate() {
-                                ui.selectable_value(&mut self.selected_material_idx, idx, &mat.name);
-                            }
-                        });
-
-                    if self.selected_material_idx != prev_idx {
-                        // Reset selection focus but don't need to rebuild
-                    }
-
-                    ui.add_space(8.0);
-                    let mut mat_changed = false;
-                    let mat = &mut self.materials[self.selected_material_idx];
-
-                    // Base Color Picker
-                    ui.horizontal(|ui| {
-                        ui.label("Base Color:");
-                        if ui.color_edit_button_rgb(&mut mat.base_color).changed() {
-                            mat_changed = true;
-                        }
-                    });
-
-                    // Roughness & Metallic
-                    if ui.add(egui::Slider::new(&mut mat.roughness, 0.0..=1.0).text("Roughness")).changed() {
-                        mat_changed = true;
-                    }
-                    if ui.add(egui::Slider::new(&mut mat.metallic, 0.0..=1.0).text("Metallic")).changed() {
-                        mat_changed = true;
-                    }
-
-                    // Transmission & Refraction (IOR)
-                    if ui.add(egui::Slider::new(&mut mat.transmission, 0.0..=1.0).text("Transmission (Glass)")).changed() {
-                        mat_changed = true;
-                    }
-                    if ui.add(egui::Slider::new(&mut mat.ior, 1.0..=2.5).text("Index of Refraction")).changed() {
-                        mat_changed = true;
-                    }
-
-                    // Emissive
-                    ui.horizontal(|ui| {
-                        ui.label("Emissive:");
-                        if ui.color_edit_button_rgb(&mut mat.emissive).changed() {
-                            mat_changed = true;
-                        }
-                    });
-                    
-                    if mat_changed {
-                        self.accum_frame = 0;
-                        // Write updated materials list to GPU buffer
-                        if let Some(render_state) = _frame.wgpu_render_state() {
-                            let gpu_mats: Vec<GpuMaterial> = self.materials.iter().map(|m| m.to_gpu()).collect();
-                            let renderer_lock = render_state.renderer.read();
-                            if let Some(res) = renderer_lock.callback_resources.get::<SharedRenderResources>() {
-                                render_state.queue.write_buffer(&res.material_buffer, 0, bytemuck::cast_slice(&gpu_mats));
-                            }
-                        }
-                    }
-                });
-
-                ui.add_space(20.0);
-                if ui.button("Reset Scene Defaults").clicked() {
-                    self.camera_rot = [0.0, 0.3];
-                    self.camera_zoom = 5.5;
-                    self.animate = false;
-                    self.auto_rotate_camera = false;
-                    self.animation_speed = 1.0;
-                    self.time = 0.0;
-                    self.accum_frame = 0;
-                    
-                    // Reset materials
-                    self.materials[0].base_color = [0.75, 0.15, 0.15]; // Red
-                    self.materials[1].base_color = [0.15, 0.75, 0.15]; // Green
-                    self.materials[2].base_color = [0.75, 0.75, 0.75]; // White
-                    self.materials[3].emissive = [12.0, 12.0, 12.0];
-                    self.materials[4].roughness = 0.15;
-                    self.materials[4].metallic = 1.0;
-                    self.materials[5].roughness = 0.05;
-                    self.materials[5].metallic = 1.0;
-                    self.materials[6].transmission = 1.0;
-                    self.materials[6].roughness = 0.0;
-
-                    let mut renderers = self.renderers.lock().unwrap();
-                    for r in renderers.iter_mut() {
-                        r.reset_defaults();
-                    }
-
-                    if let Some(render_state) = _frame.wgpu_render_state() {
-                        let gpu_mats: Vec<GpuMaterial> = self.materials.iter().map(|m| m.to_gpu()).collect();
-                        let renderer_lock = render_state.renderer.read();
-                        if let Some(res) = renderer_lock.callback_resources.get::<SharedRenderResources>() {
-                            render_state.queue.write_buffer(&res.material_buffer, 0, bytemuck::cast_slice(&gpu_mats));
-                        }
-                    }
-                }
-
-                ui.add_space(10.0);
-                ui.separator();
-                ui.add_space(10.0);
-                ui.vertical_centered(|ui| {
-                    ui.weak("Drag on the canvas to rotate camera");
-                    ui.weak("Scroll wheel to zoom camera");
-                });
-            });
-
-        // Viewport canvas
-        egui::CentralPanel::default().show(ui, |ui| {
-            egui::Frame::canvas(ui.style()).show(ui, |ui| {
-                self.render_canvas(ui);
-            });
-        });
-    }
-}
-
-impl RaymarchApp {
-    fn render_canvas(&mut self, ui: &mut egui::Ui) {
-        let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::drag());
-
-        let dt = ui.input(|i| i.stable_dt).min(0.1);
-        let mut anim_active = false;
-
-        let dt_step = if self.animate {
-            if self.render_frame_by_frame {
-                let max_accum = {
-                    let renderers = self.renderers.lock().unwrap();
-                    renderers[self.selected_renderer_idx].max_accumulation_frames()
-                };
-                if self.accum_frame >= max_accum {
-                    (1.0 / self.fps) * self.animation_speed
-                } else {
-                    0.0
-                }
-            } else {
-                dt * self.animation_speed
-            }
-        } else {
-            0.0
-        };
-
-        if dt_step > 0.0 {
-            self.time += dt_step;
-            self.accum_frame = 0;
-            anim_active = true;
-        }
-
-        if self.auto_rotate_camera {
-            self.camera_rot[0] += dt * 0.15 * self.animation_speed;
-            anim_active = true;
-        }
-
-        // Handle camera navigation
-        let mut cam_changed = false;
-        if response.dragged() {
-            self.camera_rot[0] += response.drag_delta().x * 0.005; // Yaw
-            self.camera_rot[1] = (self.camera_rot[1] + response.drag_delta().y * 0.005)
-                .clamp(0.05, 1.56); // Pitch
-            cam_changed = true;
-        }
-
-        let scroll_delta = ui.input(|i| i.smooth_scroll_delta.y);
-        if scroll_delta != 0.0 {
-            self.camera_zoom = (self.camera_zoom - scroll_delta * 0.005).clamp(2.0, 12.0);
-            cam_changed = true;
-        }
-
-        if cam_changed || anim_active {
-            self.accum_frame = 0;
-        }
-
-        // Prepare uniforms struct
-        let mut uniforms = PathTraceUniforms {
-            resolution: [rect.width(), rect.height()],
-            camera_rot: self.camera_rot,
-            camera_zoom: self.camera_zoom,
-            frame_index: self.frame_index,
-            max_depth: 4,
-            samples_per_frame: 1,
-            aperture: 0.02,
-            focal_distance: 5.5,
-            env_light_intensity: 0.4,
-            prev_camera_zoom: self.prev_camera_zoom,
-            prev_camera_rot: self.prev_camera_rot,
-            time: self.time,
-            accum_frame: self.accum_frame,
-            bvh_offsets: self.bvh_offsets,
-            tri_offsets: self.tri_offsets,
-            dt: if self.render_frame_by_frame { (1.0 / self.fps) * self.animation_speed } else { dt * self.animation_speed },
-            render_mode: 0,
-            tonemap_mode: 0,
-            _pad_align2: 0,
-        };
-
-        {
-            let renderers = self.renderers.lock().unwrap();
-            if let Some(r) = renderers.get(self.selected_renderer_idx) {
-                r.update_uniforms(&mut uniforms);
-            }
-        }
-
-        // Update previous camera parameters for the next frame
-        self.prev_camera_rot = self.camera_rot;
-        self.prev_camera_zoom = self.camera_zoom;
-
-        // Increment accumulation frame if static and below limit
-        let supports_accum = {
-            let renderers = self.renderers.lock().unwrap();
-            renderers[self.selected_renderer_idx].supports_accumulation()
-        };
-        let max_accum = {
-            let renderers = self.renderers.lock().unwrap();
-            renderers[self.selected_renderer_idx].max_accumulation_frames()
-        };
-        let is_static = supports_accum && !self.auto_rotate_camera && (!self.animate || self.render_frame_by_frame);
-        if is_static {
-            if self.accum_frame < max_accum {
-                self.accum_frame += 1;
-            }
-        } else {
-            self.accum_frame = 0;
-        }
-
-        // Always increment frame_index for ping-ponging and noise seeding
-        self.frame_index = self.frame_index.wrapping_add(1);
-
-        // Custom WGPU callback
-        ui.painter().add(egui_wgpu::Callback::new_paint_callback(
-            rect,
-            RaymarchCallback {
-                uniforms,
-                renderer_idx: self.selected_renderer_idx,
-            },
-        ));
-    }
-}
-
-struct RaymarchCallback {
-    uniforms: PathTraceUniforms,
-    renderer_idx: usize,
-}
-
-impl egui_wgpu::CallbackTrait for RaymarchCallback {
-    fn prepare(
-        &self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        _screen_descriptor: &egui_wgpu::ScreenDescriptor,
-        _egui_encoder: &mut wgpu::CommandEncoder,
-        resources: &mut egui_wgpu::CallbackResources,
-    ) -> Vec<wgpu::CommandBuffer> {
-        let mut cmd_buffers = Vec::new();
-        if let (Some(shared), Some(renderers_res)) = (
-            resources.get::<SharedRenderResources>(),
-            resources.get::<RendererVector>(),
-        ) {
-            // Write uniforms to the GPU buffer
-            queue.write_buffer(&shared.uniform_buffer, 0, bytemuck::cast_slice(&[self.uniforms]));
-
-            // Ensure accumulation textures are allocated at the correct size
-            let width = self.uniforms.resolution[0].max(1.0) as u32;
-            let height = self.uniforms.resolution[1].max(1.0) as u32;
-
-            let mut tex_lock = shared.textures.lock().unwrap();
-            let need_recreate = tex_lock.as_ref().map_or(true, |tex| tex.width != width || tex.height != height);
-
-            if need_recreate {
-                *tex_lock = Some(AccumTextures::new(device, width, height, shared));
-            }
-
-            if let Some(ref textures) = *tex_lock {
-                let use_a = self.uniforms.frame_index % 2 == 0;
-                let target_view = if use_a { &textures.view_a } else { &textures.view_b };
-                let bind_group_pt = if use_a { &textures.bind_group_pt_a } else { &textures.bind_group_pt_b };
-
-                let renderers = renderers_res.renderers.lock().unwrap();
-                if let Some(renderer) = renderers.get(self.renderer_idx) {
-                    cmd_buffers = renderer.prepare(device, queue, &self.uniforms, shared, target_view, bind_group_pt);
-                }
-            }
-        }
-        cmd_buffers
-    }
-
-    fn paint(
-        &self,
-        _info: egui::PaintCallbackInfo,
-        render_pass: &mut wgpu::RenderPass<'static>,
-        resources: &egui_wgpu::CallbackResources,
-    ) {
-        if let Some(shared) = resources.get::<SharedRenderResources>() {
-            let tex_lock = shared.textures.lock().unwrap();
-            if let Some(ref textures) = *tex_lock {
-                let use_a = self.uniforms.frame_index % 2 == 0;
-                let bind_group_disp = if use_a { &textures.bind_group_disp_a } else { &textures.bind_group_disp_b };
-
-                render_pass.set_pipeline(&shared.display_pipeline);
-                render_pass.set_bind_group(0, bind_group_disp, &[]);
-                render_pass.draw(0..6, 0..1);
-            }
-        }
-    }
-}
-
-pub struct AccumTextures {
-    width: u32,
-    height: u32,
-    #[allow(dead_code)]
-    texture_a: wgpu::Texture,
-    view_a: wgpu::TextureView,
-    #[allow(dead_code)]
-    texture_b: wgpu::Texture,
-    view_b: wgpu::TextureView,
-    bind_group_pt_a: wgpu::BindGroup,
-    bind_group_pt_b: wgpu::BindGroup,
-    bind_group_disp_a: wgpu::BindGroup,
-    bind_group_disp_b: wgpu::BindGroup,
-}
-
-impl AccumTextures {
-    fn new(
-        device: &wgpu::Device,
-        width: u32,
-        height: u32,
-        res: &SharedRenderResources,
-    ) -> Self {
-        let size = wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        };
-
-        let texture_desc = wgpu::TextureDescriptor {
-            label: Some("accum_texture"),
-            size,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba32Float,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        };
-
-        let texture_a = device.create_texture(&texture_desc);
-        let view_a = texture_a.create_view(&wgpu::TextureViewDescriptor::default());
-
-        let texture_b = device.create_texture(&texture_desc);
-        let view_b = texture_b.create_view(&wgpu::TextureViewDescriptor::default());
-
-        // Bind Group PT A: reads B, writes A
-        let bind_group_pt_a = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("bind_group_pt_a"),
-            layout: &res.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: res.uniform_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&view_b),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&res.sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: res.bvh_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: res.vertex_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: res.index_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: res.tri_material_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 7,
-                    resource: res.material_buffer.as_entire_binding(),
-                },
-            ],
-        });
-
-        // Bind Group PT B: reads A, writes B
-        let bind_group_pt_b = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("bind_group_pt_b"),
-            layout: &res.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: res.uniform_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&view_a),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&res.sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: res.bvh_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: res.vertex_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: res.index_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: res.tri_material_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 7,
-                    resource: res.material_buffer.as_entire_binding(),
-                },
-            ],
-        });
-
-        // Display Bind Group A: reads A
-        let bind_group_disp_a = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("bind_group_disp_a"),
-            layout: &res.display_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: res.uniform_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&view_a),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&res.sampler),
-                },
-            ],
-        });
-
-        // Display Bind Group B: reads B
-        let bind_group_disp_b = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("bind_group_disp_b"),
-            layout: &res.display_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: res.uniform_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&view_b),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&res.sampler),
-                },
-            ],
-        });
-
-        Self {
-            width,
-            height,
-            texture_a,
-            view_a,
-            texture_b,
-            view_b,
-            bind_group_pt_a,
-            bind_group_pt_b,
-            bind_group_disp_a,
-            bind_group_disp_b,
-        }
-    }
 }
