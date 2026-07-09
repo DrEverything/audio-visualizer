@@ -144,10 +144,13 @@ impl egui_wgpu::CallbackTrait for VisualizerCallback {
                     // High-frequency pre-emphasis: boost higher frequency bins for visualization
                     let freq_boost = 1.0 + (i as f32 / 128.0);
 
-                    // Apply normalized gain and scale (divide by FFT window 2048.0)
-                    let val = (magnitude / 2048.0 * self.gain * freq_boost)
-                        .sqrt()
-                        .clamp(0.0, 1.0);
+                    // Apply normalized gain and scale (divide by FFT window 2048.0).
+                    // Use a smooth tanh saturation instead of a hard clamp(0,1): a hard clamp
+                    // flat-tops loud bins into vertical-edged mesas (the loud bass/left bins hit
+                    // the ceiling first), and the raymarcher renders those cliffs as bright streak
+                    // artifacts on the left "when peaks are high enough". tanh asymptotes to 1.0
+                    // smoothly so the terrain stays continuous, matching Shadertoy's normalized FFT.
+                    let val = (magnitude / 2048.0 * self.gain * freq_boost).sqrt().tanh();
                     new_row[i * 4] = (val * 255.0) as u8; // R: FFT magnitude, 0..1
                     let s = self.samples[i * 2];
                     new_row[i * 4 + 1] = ((s * 0.5 + 0.5) * 255.0) as u8; // G: waveform centered at 0.5
@@ -160,7 +163,9 @@ impl egui_wgpu::CallbackTrait for VisualizerCallback {
                 for i in 0..1024 {
                     let s = self.samples[i * 2];
                     // let v = ((s * 0.5 + 0.5)).clamp(0.0, 1.0);   // map -1..1 to 0..1
-                    let v = s.abs().clamp(0.0, 1.0);
+                    // Soft-limit (tanh) instead of a hard clamp so loud peaks don't flat-top the
+                    // terrain into vertical-edged cliffs that raymarch into bright streak artifacts.
+                    let v = (s.abs() * self.gain).tanh();
                     let byte = (v * 255.0) as u8;
                     new_row[i * 4] = byte; // R drives terrain (rectified-ish via 0.5 center)
                     new_row[i * 4 + 1] = byte;
