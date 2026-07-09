@@ -250,7 +250,7 @@ pub struct LeApp {
     volume: f32,
     gain: f32,
     trigger_mode: bool, // true = Lock Phase (zero-crossing search), false = continuous raw buffer
-    window_ms: f32,     // size of window to display in ms (e.g. 5ms to 150ms)
+    wave_window_ms: f32,     // size of window to display in ms (e.g. 5ms to 150ms)
     fft_enabled: bool,  // true = standard fourier transform landscape, false = waveform only
 
     // Channels to communicate with background decoder thread
@@ -453,8 +453,8 @@ impl LeApp {
         let trigger_mode = cc.storage
             .and_then(|s| eframe::get_value(s, "trigger_mode"))
             .unwrap_or(true);
-        let window_ms = cc.storage
-            .and_then(|s| eframe::get_value(s, "window_ms"))
+        let wave_window_ms = cc.storage
+            .and_then(|s| eframe::get_value(s, "wave_window_ms"))
             .unwrap_or(150.0);
         let fft_enabled = cc.storage
             .and_then(|s| eframe::get_value(s, "fft_enabled"))
@@ -471,7 +471,7 @@ impl LeApp {
             volume,
             gain,
             trigger_mode,
-            window_ms,
+            wave_window_ms,
             fft_enabled,
             rx,
             tx,
@@ -642,7 +642,7 @@ impl eframe::App for LeApp {
             let current_frame = current_idx / (self.channels as usize);
 
             // Compute total frames in the zoom window
-            let window_frames = ((self.window_ms / 1000.0) * self.sample_rate as f32) as usize;
+            let window_frames = ((self.wave_window_ms / 1000.0) * self.sample_rate as f32) as usize;
             let window_frames = window_frames.max(32); // at least 32 frames for 2048 window
 
             let mut start_frame = current_frame;
@@ -959,10 +959,10 @@ impl eframe::App for LeApp {
                                 ui.separator();
 
                                 // Window Zoom Slider
-                                ui.label("Window:");
+                                ui.label("Frames shown:");
                                 ui.style_mut().spacing.slider_width = 80.0;
                                 ui.add(
-                                    egui::Slider::new(&mut self.window_ms, 5.0..=150.0)
+                                    egui::Slider::new(&mut self.wave_window_ms, 5.0..=150.0)
                                         .suffix("ms"),
                                 );
                             });
@@ -975,9 +975,21 @@ impl eframe::App for LeApp {
         eframe::set_value(storage, "volume", &self.volume);
         eframe::set_value(storage, "gain", &self.gain);
         eframe::set_value(storage, "trigger_mode", &self.trigger_mode);
-        eframe::set_value(storage, "window_ms", &self.window_ms);
+        eframe::set_value(storage, "wave_window_ms", &self.wave_window_ms);
         eframe::set_value(storage, "fft_enabled", &self.fft_enabled);
     }
+}
+
+fn load_icon() -> Option<egui::IconData> {
+    let image_bytes = include_bytes!("../logo.png");
+    let image = image::load_from_memory(image_bytes).ok()?;
+    let rgba_image = image.to_rgba8();
+    let (width, height) = rgba_image.dimensions();
+    Some(egui::IconData {
+        rgba: rgba_image.into_raw(),
+        width,
+        height,
+    })
 }
 
 fn main() -> eframe::Result {
@@ -1011,12 +1023,13 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 800.0])
             .with_resizable(true)
-            .with_title("Audio Wave Visualizer"),
+            .with_title("Audio Visualizer")
+            .with_icon(load_icon().unwrap_or_default()),
         ..Default::default()
     };
 
     eframe::run_native(
-        "Audio Wave Visualizer",
+        "Audio Visualizer",
         native_options,
         Box::new(|cc| match LeApp::new(cc) {
             Some(app) => Ok(Box::new(app)),

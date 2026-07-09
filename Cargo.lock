@@ -496,6 +496,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "audio-visualizer"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "eframe",
+ "env_logger",
+ "gltf",
+ "image",
+ "log",
+ "pollster",
+ "rodio",
+ "rustfft",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3929,20 +3944,6 @@ dependencies = [
  "memoffset",
  "tempfile",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "uni-ass"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "eframe",
- "env_logger",
- "gltf",
- "log",
- "pollster",
- "rodio",
- "rustfft",
 ]
 
 [[package]]

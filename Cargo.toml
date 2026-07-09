@@ -1,5 +1,5 @@
 [package]
-name = "uni-ass"
+name = "audio-visualizer"
 version = "0.1.0"
 edition = "2024"
 
@@ -7,6 +7,7 @@ edition = "2024"
 eframe = { version = "0.35.0", features = ["wgpu", "persistence"] }
 bytemuck = { version = "1.25.0", features = ["derive"] }
 env_logger = "0.11"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
 log = "0.4"
 pollster = "0.4"
 gltf = "1.4.1"
