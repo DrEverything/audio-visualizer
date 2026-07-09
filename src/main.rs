@@ -1,7 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use std::collections::VecDeque;
 use std::num::{NonZero, NonZeroU64};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Instant;
@@ -183,7 +185,9 @@ impl egui_wgpu::CallbackTrait for VisualizerCallback {
                 for i in 0..1024 {
                     let s = self.samples[i * 2];
                     // let v = ((s * 0.5 + 0.5)).clamp(0.0, 1.0);   // map -1..1 to 0..1
-                    let v = s.abs().clamp(0.0, 1.0);
+                    // Gain is applied here too, but the slider caps it low in this mode
+                    // (see UI) since the raw wave clips into noise past ~1.5.
+                    let v = (s.abs() * self.gain).clamp(0.0, 1.0);
                     // Same temporal smoothing as FFT mode (see DECAY above) so transient
                     // peaks form sloped ridges in the history instead of thin walls.
                     let prev = res.history_buffer[row_size + i * 4] as f32 / 255.0;
@@ -261,6 +265,10 @@ pub struct LeApp {
     _stream: Option<MixerDeviceSink>,
     player: Option<Player>,
 
+    // Live system audio (WASAPI loopback) capture, active only while enabled
+    system_audio_enabled: bool,
+    system_capture: Option<SystemAudioCapture>,
+
     // Current playing buffer
     current_file_name: Option<String>,
     samples: Option<Arc<Vec<f32>>>,
@@ -270,7 +278,8 @@ pub struct LeApp {
 
     // Playback settings
     volume: f32,
-    gain: f32,
+    gain: f32,      // visual gain for FFT mode (0.1..=8.0)
+    wave_gain: f32, // visual gain for raw waveform mode, capped low (0.1..=1.5)
     trigger_mode: bool, // true = Lock Phase (zero-crossing search), false = continuous raw buffer
     wave_window_ms: f32,     // size of window to display in ms (e.g. 5ms to 150ms)
     fft_enabled: bool,  // true = standard fourier transform landscape, false = waveform only
@@ -284,6 +293,7 @@ pub struct LeApp {
     time_start: Instant,
     is_loading: bool,
     controls_alpha: f32, // for fading controls in/out on hover
+    controls_rect: Option<egui::Rect>, // last-rendered panel rect, for hover detection
 }
 
 impl LeApp {
@@ -469,6 +479,9 @@ impl LeApp {
         let gain = cc.storage
             .and_then(|s| eframe::get_value(s, "gain"))
             .unwrap_or(8.0);
+        let wave_gain = cc.storage
+            .and_then(|s| eframe::get_value(s, "wave_gain"))
+            .unwrap_or(1.0);
         let trigger_mode = cc.storage
             .and_then(|s| eframe::get_value(s, "trigger_mode"))
             .unwrap_or(true);
@@ -482,6 +495,8 @@ impl LeApp {
         Some(Self {
             _stream: stream,
             player,
+            system_audio_enabled: false,
+            system_capture: None,
             current_file_name: None,
             samples: None,
             sample_rate: 44100,
@@ -489,6 +504,7 @@ impl LeApp {
             playback_pos: None,
             volume,
             gain,
+            wave_gain,
             trigger_mode,
             wave_window_ms,
             fft_enabled,
@@ -498,6 +514,7 @@ impl LeApp {
             time_start: Instant::now(),
             is_loading: false,
             controls_alpha: 0.0,
+            controls_rect: None,
         })
     }
 }
@@ -519,6 +536,180 @@ fn decode_audio_file(
     let samples: Vec<f32> = source.collect();
 
     Ok((samples, sample_rate, channels))
+}
+
+// Live capture of whatever is playing on the system's default output device.
+// On Windows this uses WASAPI loopback: cpal opens the *output* device as an
+// *input* stream, so we receive a copy of the audio the speakers are playing
+// without any virtual audio cable. The captured interleaved f32 samples are kept
+// in a bounded ring buffer that the visualizer reads the tail of each frame.
+struct SystemAudioCapture {
+    ring: Arc<Mutex<VecDeque<f32>>>,
+    sample_rate: u32,
+    channels: u16,
+    _stream: cpal::Stream,
+}
+
+impl SystemAudioCapture {
+    fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+
+        let host = cpal::default_host();
+        let device = host
+            .default_output_device()
+            .ok_or("No default output device found")?;
+
+        // Loopback capture uses the output device's own (output) config.
+        let config = device.default_output_config()?;
+        let sample_rate = config.sample_rate().0;
+        let channels = config.channels();
+        let sample_format = config.sample_format();
+        let stream_config: cpal::StreamConfig = config.into();
+
+        // ~2 seconds of headroom; the visualizer only reads the most recent window.
+        let capacity = (sample_rate as usize) * (channels as usize) * 2;
+        let ring = Arc::new(Mutex::new(VecDeque::with_capacity(capacity)));
+        let ring_cb = ring.clone();
+
+        let err_fn = |err| log::warn!("System audio loopback stream error: {}", err);
+
+        // WASAPI shared mode almost always hands us f32, but be tolerant of i16/u16.
+        let stream = match sample_format {
+            cpal::SampleFormat::F32 => device.build_input_stream(
+                &stream_config,
+                move |data: &[f32], _: &_| push_samples(&ring_cb, data, capacity),
+                err_fn,
+                None,
+            )?,
+            cpal::SampleFormat::I16 => device.build_input_stream(
+                &stream_config,
+                move |data: &[i16], _: &_| {
+                    let f: Vec<f32> = data.iter().map(|&s| s as f32 / 32768.0).collect();
+                    push_samples(&ring_cb, &f, capacity);
+                },
+                err_fn,
+                None,
+            )?,
+            cpal::SampleFormat::U16 => device.build_input_stream(
+                &stream_config,
+                move |data: &[u16], _: &_| {
+                    let f: Vec<f32> =
+                        data.iter().map(|&s| (s as f32 - 32768.0) / 32768.0).collect();
+                    push_samples(&ring_cb, &f, capacity);
+                },
+                err_fn,
+                None,
+            )?,
+            other => return Err(format!("Unsupported sample format: {:?}", other).into()),
+        };
+
+        stream.play()?;
+
+        Ok(Self {
+            ring,
+            sample_rate,
+            channels,
+            _stream: stream,
+        })
+    }
+
+    // Snapshot the current ring buffer contents (oldest -> newest, interleaved).
+    fn snapshot(&self) -> Vec<f32> {
+        match self.ring.lock() {
+            Ok(buf) => buf.iter().copied().collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+}
+
+// Push interleaved samples into the ring buffer, dropping the oldest to stay bounded.
+fn push_samples(ring: &Arc<Mutex<VecDeque<f32>>>, data: &[f32], capacity: usize) {
+    if let Ok(mut buf) = ring.lock() {
+        for &s in data {
+            if buf.len() >= capacity {
+                buf.pop_front();
+            }
+            buf.push_back(s);
+        }
+    }
+}
+
+// Build the 2048-sample visualizer window from an interleaved sample buffer.
+// Shared by file playback (window follows the play head) and live system audio
+// (window pinned to the most recent samples, positioned by the caller).
+fn compute_visualizer_window(
+    samples: &[f32],
+    current_frame: usize,
+    channels: usize,
+    sample_rate: u32,
+    wave_window_ms: f32,
+    trigger_mode: bool,
+) -> Vec<f32> {
+    let mut visualizer_samples = vec![0.0f32; 2048];
+    let channels = channels.max(1);
+    let total_samples = samples.len();
+    let total_frames = total_samples / channels;
+
+    // Compute total frames in the zoom window
+    let window_frames = ((wave_window_ms / 1000.0) * sample_rate as f32) as usize;
+    let window_frames = window_frames.max(32); // at least 32 frames for 2048 window
+
+    let mut start_frame = current_frame;
+
+    if trigger_mode {
+        // Stabilize wave phase via Oscilloscope Rising-Edge Zero-Crossing Triggering.
+        // We search ahead for a zero-crossing based on mono mixed values.
+        let search_len = 1024.min(total_frames.saturating_sub(current_frame));
+        for f in 0..search_len {
+            let f_idx = current_frame + f;
+
+            let mut v1 = 0.0;
+            let mut count = 0;
+            for c in 0..channels {
+                let idx = f_idx * channels + c;
+                if idx < total_samples {
+                    v1 += samples[idx];
+                    count += 1;
+                }
+            }
+            let mono1 = if count > 0 { v1 / count as f32 } else { 0.0 };
+
+            let mut v2 = 0.0;
+            let mut count2 = 0;
+            for c in 0..channels {
+                let idx = (f_idx + 1) * channels + c;
+                if idx < total_samples {
+                    v2 += samples[idx];
+                    count2 += 1;
+                }
+            }
+            let mono2 = if count2 > 0 { v2 / count2 as f32 } else { 0.0 };
+
+            if mono1 < 0.0 && mono2 >= 0.0 {
+                start_frame = f_idx;
+                break;
+            }
+        }
+    }
+
+    // Downsample/interpolate the window down to 2048 samples
+    for i in 0..2048 {
+        let frame_offset = (i * window_frames) / 2048;
+        let target_frame = start_frame + frame_offset;
+
+        let mut sum = 0.0;
+        let mut count = 0;
+        for c in 0..channels {
+            let idx = target_frame * channels + c;
+            if idx < total_samples {
+                sum += samples[idx];
+                count += 1;
+            }
+        }
+        visualizer_samples[i] = if count > 0 { sum / count as f32 } else { 0.0 };
+    }
+
+    visualizer_samples
 }
 
 impl eframe::App for LeApp {
@@ -654,70 +845,37 @@ impl eframe::App for LeApp {
 
         // Extract and trigger audio samples to write to visualizer (2048 samples window)
         let mut visualizer_samples = vec![0.0f32; 2048];
-        if let (Some(samples), Some(playback_pos)) = (&self.samples, &self.playback_pos) {
-            let current_idx = playback_pos.load(Ordering::Relaxed);
-            let total_samples = samples.len();
-            let total_frames = total_samples / (self.channels as usize);
-            let current_frame = current_idx / (self.channels as usize);
-
-            // Compute total frames in the zoom window
-            let window_frames = ((self.wave_window_ms / 1000.0) * self.sample_rate as f32) as usize;
-            let window_frames = window_frames.max(32); // at least 32 frames for 2048 window
-
-            let mut start_frame = current_frame;
-
-            if self.trigger_mode {
-                // Stabilize wave phase via Oscilloscope Rising-Edge Zero-Crossing Triggering.
-                // We search ahead for a zero-crossing based on mono mixed values.
-                let search_len = 1024.min(total_frames.saturating_sub(current_frame));
-                for f in 0..search_len {
-                    let f_idx = current_frame + f;
-
-                    let mut v1 = 0.0;
-                    let mut count = 0;
-                    for c in 0..(self.channels as usize) {
-                        let idx = f_idx * (self.channels as usize) + c;
-                        if idx < total_samples {
-                            v1 += samples[idx];
-                            count += 1;
-                        }
-                    }
-                    let mono1 = if count > 0 { v1 / count as f32 } else { 0.0 };
-
-                    let mut v2 = 0.0;
-                    let mut count2 = 0;
-                    for c in 0..(self.channels as usize) {
-                        let idx = (f_idx + 1) * (self.channels as usize) + c;
-                        if idx < total_samples {
-                            v2 += samples[idx];
-                            count2 += 1;
-                        }
-                    }
-                    let mono2 = if count2 > 0 { v2 / count2 as f32 } else { 0.0 };
-
-                    if mono1 < 0.0 && mono2 >= 0.0 {
-                        start_frame = f_idx;
-                        break;
-                    }
-                }
+        if self.system_audio_enabled {
+            // Live system audio: window is pinned to the most recent captured samples.
+            if let Some(cap) = &self.system_capture {
+                let snapshot = cap.snapshot();
+                let channels = cap.channels as usize;
+                let total_frames = snapshot.len() / channels.max(1);
+                let window_frames =
+                    ((self.wave_window_ms / 1000.0) * cap.sample_rate as f32) as usize;
+                // Leave 1024 frames of headroom at the tail so the trigger search and
+                // windowing don't run past the newest captured samples.
+                let current_frame = total_frames.saturating_sub(window_frames + 1024);
+                visualizer_samples = compute_visualizer_window(
+                    &snapshot,
+                    current_frame,
+                    channels,
+                    cap.sample_rate,
+                    self.wave_window_ms,
+                    self.trigger_mode,
+                );
             }
-
-            // Downsample/interpolate the window down to 2048 samples
-            for i in 0..2048 {
-                let frame_offset = (i * window_frames) / 2048;
-                let target_frame = start_frame + frame_offset;
-
-                let mut sum = 0.0;
-                let mut count = 0;
-                for c in 0..(self.channels as usize) {
-                    let idx = target_frame * (self.channels as usize) + c;
-                    if idx < total_samples {
-                        sum += samples[idx];
-                        count += 1;
-                    }
-                }
-                visualizer_samples[i] = if count > 0 { sum / count as f32 } else { 0.0 };
-            }
+        } else if let (Some(samples), Some(playback_pos)) = (&self.samples, &self.playback_pos) {
+            let current_frame =
+                playback_pos.load(Ordering::Relaxed) / (self.channels as usize).max(1);
+            visualizer_samples = compute_visualizer_window(
+                samples,
+                current_frame,
+                self.channels as usize,
+                self.sample_rate,
+                self.wave_window_ms,
+                self.trigger_mode,
+            );
         }
 
         // Draw visualizer shader. Pass accurate painting rectangle size to ensure pixel scaling matching.
@@ -729,28 +887,29 @@ impl eframe::App for LeApp {
                 resolution: paint_rect.size(),
                 samples: visualizer_samples,
                 fft_enabled: self.fft_enabled,
-                gain: self.gain,
+                gain: if self.fft_enabled { self.gain } else { self.wave_gain },
             },
         ));
 
         // Force repaint to animate shader
         ctx.request_repaint();
 
-        // Calculate floating overlay parameters
+        // Calculate floating overlay parameters. Width tracks the window so the panel
+        // never overflows a narrow window (leaving a 40px margin), capped at 1050px on
+        // wide screens. The panel is anchored bottom-center and sizes its own height,
+        // so its contents can wrap onto extra rows without being clipped.
         let screen_w = rect.width();
-        let control_w = (screen_w * 0.82).clamp(500.0, 1050.0);
-        let control_h = 130.0;
+        let control_w = (screen_w - 40.0).clamp(280.0, 1050.0);
 
-        let overlay_pos = egui::pos2(
-            rect.left() + (screen_w - control_w) * 0.5,
-            rect.bottom() - control_h - 20.0,
-        );
-
-        let overlay_rect = egui::Rect::from_min_size(overlay_pos, egui::vec2(control_w, control_h));
-
-        // Show controls only if the pointer is inside the bottom control panel region
+        // Show controls when the pointer is near the bottom of the window, or hovering
+        // the panel itself (using last frame's measured rect so tall/wrapped panels stay
+        // visible while being used).
         let show_controls = if let Some(hover_pos) = ctx.input(|i| i.pointer.hover_pos()) {
-            overlay_rect.contains(hover_pos) || hover_pos.y > rect.bottom() - 150.0
+            let in_band = hover_pos.y > rect.bottom() - 150.0;
+            let in_panel = self
+                .controls_rect
+                .is_some_and(|r| r.expand(8.0).contains(hover_pos));
+            in_band || in_panel
         } else {
             false
         };
@@ -763,11 +922,10 @@ impl eframe::App for LeApp {
 
         // Render controls panel only if it's visible
         if self.controls_alpha > 0.001 {
-            egui::Area::new(egui::Id::new("controls"))
-                .fixed_pos(overlay_pos)
+            let area_response = egui::Area::new(egui::Id::new("controls"))
+                .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -20.0))
                 .show(ctx, |ui| {
                     ui.set_width(control_w);
-                    ui.set_height(control_h);
                     ui.set_opacity(self.controls_alpha);
 
                     egui::Frame::new()
@@ -872,8 +1030,9 @@ impl eframe::App for LeApp {
 
                             ui.add_space(8.0);
 
-                            // Media Control Row
-                            ui.horizontal(|ui| {
+                            // Media Control Row. Wrapped so the buttons/sliders flow onto
+                            // additional rows instead of overflowing on narrow windows.
+                            ui.horizontal_wrapped(|ui| {
                                 let is_playing = self.player.as_ref().map_or(false, |p| {
                                     !p.is_paused()
                                         && self.playback_pos.as_ref().map_or(false, |pos| {
@@ -958,17 +1117,71 @@ impl eframe::App for LeApp {
 
                                 ui.separator();
 
-                                // Waveform Visual Gain Slider
+                                // Visual Gain Slider. Raw waveform mode gets a much lower
+                                // ceiling (it clips into noise past ~1.5), and keeps its own
+                                // value so switching modes doesn't clobber the FFT gain.
                                 ui.label("Gain:");
                                 ui.style_mut().spacing.slider_width = 80.0;
-                                ui.add(
-                                    egui::Slider::new(&mut self.gain, 0.1..=8.0).show_value(true),
-                                );
+                                if self.fft_enabled {
+                                    ui.add(
+                                        egui::Slider::new(&mut self.gain, 0.1..=8.0)
+                                            .show_value(true),
+                                    );
+                                } else {
+                                    ui.add(
+                                        egui::Slider::new(&mut self.wave_gain, 0.1..=1.5)
+                                            .show_value(true),
+                                    );
+                                }
 
                                 ui.separator();
 
                                 // Visual Mode Toggle (FFT vs Waveform)
                                 ui.checkbox(&mut self.fft_enabled, "Standard (FFT + Wave)");
+
+                                ui.separator();
+
+                                // System Audio (WASAPI loopback) Toggle: visualize whatever
+                                // is currently playing on the machine's default output device.
+                                let mut sys = self.system_audio_enabled;
+                                if ui
+                                    .checkbox(&mut sys, "System Audio")
+                                    .on_hover_text(
+                                        "Visualize whatever is currently playing on your PC",
+                                    )
+                                    .changed()
+                                {
+                                    if sys {
+                                        match SystemAudioCapture::new() {
+                                            Ok(cap) => {
+                                                // Pause file playback so the two sources don't
+                                                // fight over the visualizer (and the speakers).
+                                                if let Some(ref player) = self.player {
+                                                    player.pause();
+                                                }
+                                                self.status_msg =
+                                                    "Visualizing system audio (whatever is \
+                                                     playing on your PC)"
+                                                        .to_string();
+                                                self.system_capture = Some(cap);
+                                                self.system_audio_enabled = true;
+                                            }
+                                            Err(e) => {
+                                                self.system_audio_enabled = false;
+                                                self.system_capture = None;
+                                                self.status_msg = format!(
+                                                    "Couldn't capture system audio: {}",
+                                                    e
+                                                );
+                                            }
+                                        }
+                                    } else {
+                                        self.system_capture = None;
+                                        self.system_audio_enabled = false;
+                                        self.status_msg =
+                                            "Stopped system audio capture.".to_string();
+                                    }
+                                }
 
                                 ui.separator();
 
@@ -987,12 +1200,18 @@ impl eframe::App for LeApp {
                             });
                         });
                 });
+            // Remember where the panel landed so next frame's hover test keeps it
+            // visible while the pointer is over it (even if it wrapped taller).
+            self.controls_rect = Some(area_response.response.rect);
+        } else {
+            self.controls_rect = None;
         }
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, "volume", &self.volume);
         eframe::set_value(storage, "gain", &self.gain);
+        eframe::set_value(storage, "wave_gain", &self.wave_gain);
         eframe::set_value(storage, "trigger_mode", &self.trigger_mode);
         eframe::set_value(storage, "wave_window_ms", &self.wave_window_ms);
         eframe::set_value(storage, "fft_enabled", &self.fft_enabled);

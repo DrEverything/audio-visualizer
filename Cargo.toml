@@ -13,6 +13,7 @@ pollster = "0.4"
 gltf = "1.4.1"
 rodio = "0.22.2"
 rustfft = "6.4.1"
+cpal = "0.15"
 
 
 [profile.dev]
