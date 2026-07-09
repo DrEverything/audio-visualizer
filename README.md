@@ -5,6 +5,7 @@
 # Audio Visualizer
 
 A ray marched audio visualizer built using **Rust**, **eframe (egui + wgpu)**, **rodio**, and **rustfft**. It also has persistent state, mostly :P
+Drag and drop an audio file and everything should start automatically.
 
 ## Installation & Setup
 
@@ -23,7 +24,7 @@ Or run via Cargo:
 cargo run --release
 ```
 
-## In case you donwload the binary. Windows Security Warnings
+### You could download the binary from the releases. If you go that route:
 
 If Windows SmartScreen warns you with *"Windows protected your PC"* when downloading or running the compiled `.exe`:
 1. Click **"More info"**.
