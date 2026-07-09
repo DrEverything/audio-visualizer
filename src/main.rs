@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use std::num::{NonZero, NonZeroU64};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
