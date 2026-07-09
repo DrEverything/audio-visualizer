@@ -125,15 +125,32 @@ impl egui_wgpu::CallbackTrait for VisualizerCallback {
 
             let mut new_row = vec![0u8; row_size];
 
+            // Temporal decay factor for the R (terrain) channel, mimicking Web Audio
+            // AnalyserNode smoothing (Shadertoy's audio source). Values rise instantly but
+            // decay over ~15 frames. Without this, a one-frame transient occupies a single
+            // history row: a paper-thin tall wall in the 3D terrain that the raymarcher
+            // steps over stochastically, rendering as speckled "ghost" streaks receding
+            // into the distance (worst on the left, where the loud bass bins live).
+            const DECAY: f32 = 0.82;
+
             if self.fft_enabled {
-                // 1. Run 2048-point Forward FFT
+                // 1. Run 2048-point Forward FFT with a Hann window. Web Audio applies a
+                //    window (Blackman) before its FFT; a raw rectangular window leaks
+                //    -13 dB sidelobes around loud bass bins that flicker frame-to-frame
+                //    as shimmering noise on the left side of the spectrum.
                 let mut planner = FftPlanner::new();
                 let fft = planner.plan_fft_forward(2048);
 
+                let n = self.samples.len() as f32;
                 let mut fft_buffer: Vec<Complex<f32>> = self
                     .samples
                     .iter()
-                    .map(|&s| Complex { re: s, im: 0.0 })
+                    .enumerate()
+                    .map(|(idx, &s)| {
+                        let w = 0.5
+                            - 0.5 * (std::f32::consts::TAU * idx as f32 / (n - 1.0)).cos();
+                        Complex { re: s * w, im: 0.0 }
+                    })
                     .collect();
 
                 fft.process(&mut fft_buffer);
@@ -146,17 +163,18 @@ impl egui_wgpu::CallbackTrait for VisualizerCallback {
                     // High-frequency pre-emphasis: boost higher frequency bins for visualization
                     let freq_boost = 1.0 + (i as f32 / 128.0);
 
-                    // Apply normalized gain and scale (divide by FFT window 2048.0).
-                    // Use a smooth tanh saturation instead of a hard clamp(0,1): a hard clamp
-                    // flat-tops loud bins into vertical-edged mesas (the loud bass/left bins hit
-                    // the ceiling first), and the raymarcher renders those cliffs as bright streak
-                    // artifacts on the left "when peaks are high enough". tanh asymptotes to 1.0
-                    // smoothly so the terrain stays continuous, matching Shadertoy's normalized FFT.
-                    let val = (magnitude / 2048.0 * self.gain * freq_boost).sqrt().tanh();
+                    // Apply normalized gain and scale. Divide by 1024 (not 2048) to
+                    // compensate the Hann window's 0.5 coherent gain. tanh soft-limits
+                    // instead of a hard clamp so loud bins don't flat-top into cliffs.
+                    let val = (magnitude / 1024.0 * self.gain * freq_boost).sqrt().tanh();
+                    // Temporal smoothing: rise instantly, decay slowly (peak-hold style),
+                    // reading the previous frame's row (now shifted to row 1).
+                    let prev = res.history_buffer[row_size + i * 4] as f32 / 255.0;
+                    let val = val.max(prev * DECAY);
                     new_row[i * 4] = (val * 255.0) as u8; // R: FFT magnitude, 0..1
                     let s = self.samples[i * 2];
                     new_row[i * 4 + 1] = ((s * 0.5 + 0.5) * 255.0) as u8; // G: waveform centered at 0.5
-                    let raw = (magnitude / 2048.0 * self.gain).sqrt().clamp(0.0, 1.0);
+                    let raw = (magnitude / 1024.0 * self.gain).sqrt().clamp(0.0, 1.0);
                     new_row[i * 4 + 2] = (raw * 255.0) as u8; // B: raw magnitude
                     new_row[i * 4 + 3] = 255;
                 }
@@ -165,9 +183,11 @@ impl egui_wgpu::CallbackTrait for VisualizerCallback {
                 for i in 0..1024 {
                     let s = self.samples[i * 2];
                     // let v = ((s * 0.5 + 0.5)).clamp(0.0, 1.0);   // map -1..1 to 0..1
-                    // Soft-limit (tanh) instead of a hard clamp so loud peaks don't flat-top the
-                    // terrain into vertical-edged cliffs that raymarch into bright streak artifacts.
-                    let v = (s.abs() * self.gain).tanh();
+                    let v = s.abs().clamp(0.0, 1.0);
+                    // Same temporal smoothing as FFT mode (see DECAY above) so transient
+                    // peaks form sloped ridges in the history instead of thin walls.
+                    let prev = res.history_buffer[row_size + i * 4] as f32 / 255.0;
+                    let v = v.max(prev * DECAY);
                     let byte = (v * 255.0) as u8;
                     new_row[i * 4] = byte; // R drives terrain (rectified-ish via 0.5 center)
                     new_row[i * 4 + 1] = byte;
@@ -302,15 +322,12 @@ impl LeApp {
 
         let audio_texture_view = audio_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        // Create linear sampler matching Shadertoy audio channel settings.
-        // Shadertoy's iChannel audio texture wraps (Repeat) by default. The horizontal
-        // coordinate (p.x + 4.5) / 30.0 goes negative on the left side of the screen; with
-        // ClampToEdge that pins to column 0 and extrudes the loudest (bass/first) bin into a
-        // tall flat wall on high peaks, which raymarches into bright streak artifacts. Repeat
-        // wraps those out-of-range samples to the quiet high end instead, matching the original.
+        // Create linear clamped sampler matching Shadertoy audio channel settings
+        // (music channels default to filter=linear, wrap=clamp). Repeat would bleed the
+        // right edge of the texture into the left edge via linear filtering.
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("audio_sampler"),
-            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
