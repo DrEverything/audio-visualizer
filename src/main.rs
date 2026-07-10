@@ -133,7 +133,7 @@ impl egui_wgpu::CallbackTrait for VisualizerCallback {
             // history row: a paper-thin tall wall in the 3D terrain that the raymarcher
             // steps over stochastically, rendering as speckled "ghost" streaks receding
             // into the distance (worst on the left, where the loud bass bins live).
-            const DECAY: f32 = 0.82;
+            const DECAY: f32 = (0.82 / 15.) * 17.;
 
             if self.fft_enabled {
                 // 1. Run 2048-point Forward FFT with a Hann window. Web Audio applies a
@@ -149,8 +149,7 @@ impl egui_wgpu::CallbackTrait for VisualizerCallback {
                     .iter()
                     .enumerate()
                     .map(|(idx, &s)| {
-                        let w = 0.5
-                            - 0.5 * (std::f32::consts::TAU * idx as f32 / (n - 1.0)).cos();
+                        let w = 0.5 - 0.5 * (std::f32::consts::TAU * idx as f32 / (n - 1.0)).cos();
                         Complex { re: s * w, im: 0.0 }
                     })
                     .collect();
@@ -278,11 +277,11 @@ pub struct LeApp {
 
     // Playback settings
     volume: f32,
-    gain: f32,      // visual gain for FFT mode (0.1..=8.0)
-    wave_gain: f32, // visual gain for raw waveform mode, capped low (0.1..=1.5)
-    trigger_mode: bool, // true = Lock Phase (zero-crossing search), false = continuous raw buffer
-    wave_window_ms: f32,     // size of window to display in ms (e.g. 5ms to 150ms)
-    fft_enabled: bool,  // true = standard fourier transform landscape, false = waveform only
+    gain: f32,           // visual gain for FFT mode (0.1..=8.0)
+    wave_gain: f32,      // visual gain for raw waveform mode, capped low (0.1..=1.5)
+    trigger_mode: bool,  // true = Lock Phase (zero-crossing search), false = continuous raw buffer
+    wave_window_ms: f32, // size of window to display in ms (e.g. 5ms to 150ms)
+    fft_enabled: bool,   // true = standard fourier transform landscape, false = waveform only
 
     // Channels to communicate with background decoder thread
     rx: Receiver<AudioMessage>,
@@ -292,7 +291,7 @@ pub struct LeApp {
     status_msg: String,
     time_start: Instant,
     is_loading: bool,
-    controls_alpha: f32, // for fading controls in/out on hover
+    controls_alpha: f32,               // for fading controls in/out on hover
     controls_rect: Option<egui::Rect>, // last-rendered panel rect, for hover detection
 }
 
@@ -473,30 +472,65 @@ impl LeApp {
         let (tx, rx) = channel();
 
         // Load persisted settings if available
-        let volume = cc.storage
+        let volume = cc
+            .storage
             .and_then(|s| eframe::get_value(s, "volume"))
             .unwrap_or(0.5);
-        let gain = cc.storage
+        let gain = cc
+            .storage
             .and_then(|s| eframe::get_value(s, "gain"))
-            .unwrap_or(8.0);
-        let wave_gain = cc.storage
+            .unwrap_or(4.0);
+        let wave_gain = cc
+            .storage
             .and_then(|s| eframe::get_value(s, "wave_gain"))
             .unwrap_or(1.0);
-        let trigger_mode = cc.storage
+        let trigger_mode = cc
+            .storage
             .and_then(|s| eframe::get_value(s, "trigger_mode"))
             .unwrap_or(true);
-        let wave_window_ms = cc.storage
+        let wave_window_ms = cc
+            .storage
             .and_then(|s| eframe::get_value(s, "wave_window_ms"))
-            .unwrap_or(150.0);
-        let fft_enabled = cc.storage
+            .unwrap_or(70.0);
+        let fft_enabled = cc
+            .storage
             .and_then(|s| eframe::get_value(s, "fft_enabled"))
+            .unwrap_or(false);
+        let system_audio_enabled = cc
+            .storage
+            .and_then(|s| eframe::get_value(s, "system_audio_enabled"))
             .unwrap_or(true);
+
+        let system_capture;
+        let status_msg;
+        if system_audio_enabled {
+            match SystemAudioCapture::new() {
+                Ok(cap) => {
+                    // Pause file playback so the two sources don't
+                    // fight over the visualizer (and the speakers).
+                    if let Some(ref player) = player {
+                        player.pause();
+                    }
+                    status_msg = "Visualizing system audio (whatever is \
+                                                     playing on your PC)"
+                        .to_string();
+                    system_capture = Some(cap);
+                }
+                Err(e) => {
+                    system_capture = None;
+                    status_msg = format!("Couldn't capture system audio: {}", e);
+                }
+            }
+        } else {
+            system_capture = None;
+            status_msg = "Stopped system audio capture.".to_string();
+        }
 
         Some(Self {
             _stream: stream,
             player,
-            system_audio_enabled: false,
-            system_capture: None,
+            system_audio_enabled,
+            system_capture,
             current_file_name: None,
             samples: None,
             sample_rate: 44100,
@@ -510,7 +544,7 @@ impl LeApp {
             fft_enabled,
             rx,
             tx,
-            status_msg: "Drag & Drop an audio file (MP3, WAV, FLAC, OGG) here to play!".to_string(),
+            status_msg,
             time_start: Instant::now(),
             is_loading: false,
             controls_alpha: 0.0,
@@ -593,8 +627,10 @@ impl SystemAudioCapture {
             cpal::SampleFormat::U16 => device.build_input_stream(
                 &stream_config,
                 move |data: &[u16], _: &_| {
-                    let f: Vec<f32> =
-                        data.iter().map(|&s| (s as f32 - 32768.0) / 32768.0).collect();
+                    let f: Vec<f32> = data
+                        .iter()
+                        .map(|&s| (s as f32 - 32768.0) / 32768.0)
+                        .collect();
                     push_samples(&ring_cb, &f, capacity);
                 },
                 err_fn,
@@ -717,8 +753,6 @@ impl eframe::App for LeApp {
         let ctx = ui.ctx();
         ctx.set_visuals(egui::Visuals::dark());
 
-
-
         // Process message from audio decoder thread
         if let Ok(msg) = self.rx.try_recv() {
             self.is_loading = false;
@@ -748,8 +782,11 @@ impl eframe::App for LeApp {
                     self._stream = None;
 
                     // Re-create the stream and player with the new sample rate and channels
-                    let new_stream = if let (Some(rate), Some(ch)) = (NonZero::new(sample_rate), NonZero::new(channels)) {
-                        if let Ok(builder) = rodio::stream::DeviceSinkBuilder::from_default_device() {
+                    let new_stream = if let (Some(rate), Some(ch)) =
+                        (NonZero::new(sample_rate), NonZero::new(channels))
+                    {
+                        if let Ok(builder) = rodio::stream::DeviceSinkBuilder::from_default_device()
+                        {
                             let builder = builder.with_sample_rate(rate).with_channels(ch);
                             builder.open_sink_or_fallback().ok()
                         } else {
@@ -760,15 +797,14 @@ impl eframe::App for LeApp {
                     };
 
                     // Fallback to default sink if custom configuration failed
-                    let new_stream = new_stream.or_else(|| {
-                        rodio::stream::DeviceSinkBuilder::open_default_sink().ok()
-                    });
+                    let new_stream = new_stream
+                        .or_else(|| rodio::stream::DeviceSinkBuilder::open_default_sink().ok());
 
                     if let Some(s) = new_stream {
                         let mixer = s.mixer();
                         let new_player = Player::connect_new(&mixer);
                         new_player.set_volume(self.volume);
-                        
+
                         let source = VisualizerSource {
                             samples: samples.clone(),
                             pos: 0,
@@ -887,7 +923,11 @@ impl eframe::App for LeApp {
                 resolution: paint_rect.size(),
                 samples: visualizer_samples,
                 fft_enabled: self.fft_enabled,
-                gain: if self.fft_enabled { self.gain } else { self.wave_gain },
+                gain: if self.fft_enabled {
+                    self.gain
+                } else {
+                    self.wave_gain
+                },
             },
         ));
 
@@ -1169,10 +1209,8 @@ impl eframe::App for LeApp {
                                             Err(e) => {
                                                 self.system_audio_enabled = false;
                                                 self.system_capture = None;
-                                                self.status_msg = format!(
-                                                    "Couldn't capture system audio: {}",
-                                                    e
-                                                );
+                                                self.status_msg =
+                                                    format!("Couldn't capture system audio: {}", e);
                                             }
                                         }
                                     } else {
@@ -1215,6 +1253,7 @@ impl eframe::App for LeApp {
         eframe::set_value(storage, "trigger_mode", &self.trigger_mode);
         eframe::set_value(storage, "wave_window_ms", &self.wave_window_ms);
         eframe::set_value(storage, "fft_enabled", &self.fft_enabled);
+        eframe::set_value(storage, "system_audio_enabled", &self.system_audio_enabled);
     }
 }
 

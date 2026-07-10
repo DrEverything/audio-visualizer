@@ -14,12 +14,10 @@ def main():
     # Capture and forward all CLI arguments to cargo run
     # Defaults to --release mode unless --debug is explicitly passed.
     args = sys.argv[1:]
-    if "--debug" in args:
-        args.remove("--debug")
-        cmd = ["cargo", "run"] + args
+    if "--release" in args:
+        args.remove("--release")
+        cmd = ["cargo", "run", "--release"] + args
     else:
-        if "--release" not in args:
-            args.append("--release")
         cmd = ["cargo", "run"] + args
 
     print(f"Executing: {' '.join(cmd)}")
