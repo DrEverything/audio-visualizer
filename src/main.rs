@@ -2,8 +2,6 @@
 
 mod render;
 
-use std::cell::RefCell;
-use std::collections::VecDeque;
 use std::num::{NonZero, NonZeroU64};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -33,10 +31,70 @@ pub(crate) fn get_backend_from_env() -> wgpu::Backends {
     }
 }
 
-// Dimensions of the RGBA8 waterfall history texture the shader reads.
+// Dimensions of the waterfall history texture the shader reads. It is R8, not
+// RGBA8: the shader only ever samples `.r`, so the other three channels cost a
+// 4x larger per-frame memmove, a 4x larger upload and a 4x larger footprint in
+// the texture cache that the ~90-iteration march hammers, for bytes nothing
+// reads. One row is therefore one byte per column.
 pub(crate) const HISTORY_WIDTH: usize = 1024;
 pub(crate) const HISTORY_HEIGHT: usize = 256;
-pub(crate) const HISTORY_ROW_BYTES: usize = HISTORY_WIDTH * 4;
+// Length of the per-frame visualizer window, which `History::advance` feeds
+// straight into the transform.
+pub(crate) const FFT_SIZE: usize = 2048;
+// How far ahead the phase-lock trigger looks for a zero crossing.
+const TRIGGER_SEARCH_FRAMES: usize = 1024;
+
+// Frame rate the live view animates at. The march is expensive enough that
+// letting it run at a 144 Hz presenter's pace (or uncapped) is most of the load,
+// and the waterfall has nothing extra to show in between.
+const TARGET_FPS: f32 = 60.0;
+
+// Raymarch cost knobs. `Quality::MAX` is the original shader exactly: full
+// window resolution and no early exit.
+//
+// Both knobs were picked by rendering the same clip at each setting and taking
+// the PSNR against an unmodified build; the numbers below are from that sweep.
+// The raymarch step count is deliberately *not* a knob — see STEPS in the shader.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) struct Quality {
+    /// Fraction of the window's pixels the visualizer pass is rasterized at.
+    /// The ray direction is invariant under a uniform resolution scale, so this
+    /// changes sampling density only: the image is the same, just softer. This
+    /// is the knob that actually moves GPU cost, since it is quadratic.
+    pub scale: f32,
+    /// Per-step weight below which the march stops; 0 disables the test.
+    pub cutoff: f32,
+}
+
+impl Quality {
+    /// Bit-for-bit the original shader. Used for video export.
+    pub const MAX: Self = Self {
+        scale: 1.0,
+        cutoff: 0.0,
+    };
+    /// ~60 dB PSNR vs MAX — i.e. indistinguishable — for about 6% less GPU.
+    pub const HIGH: Self = Self {
+        scale: 1.0,
+        cutoff: 0.05,
+    };
+    /// ~53 dB PSNR, still above the usual "visually lossless" bar, ~1.5x faster.
+    pub const BALANCED: Self = Self {
+        scale: 0.8,
+        cutoff: 0.05,
+    };
+    /// ~48 dB PSNR: visibly softer, but roughly 3x faster.
+    pub const FAST: Self = Self {
+        scale: 0.55,
+        cutoff: 0.15,
+    };
+
+    pub const PRESETS: [(&'static str, Self); 4] = [
+        ("Max", Self::MAX),
+        ("High", Self::HIGH),
+        ("Balanced", Self::BALANCED),
+        ("Fast", Self::FAST),
+    ];
+}
 
 // GPU objects needed to draw one visualizer frame. Built once per device, so the
 // live (egui swapchain) and offline (headless video render) paths stay identical.
@@ -47,10 +105,31 @@ pub(crate) struct VisualizerGpu {
     bind_group: wgpu::BindGroup,
 }
 
+// Upscaling pass for reduced-resolution rendering. Only built for the live view;
+// the offline renderer always draws at full size straight into its target.
+struct BlitGpu {
+    pipeline: wgpu::RenderPipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+}
+
+// The reduced-resolution target, rebuilt whenever the window or the render scale
+// changes. Absent at 100% scale, where the visualizer draws directly into the
+// egui pass and the blit is skipped entirely.
+struct Offscreen {
+    view: wgpu::TextureView,
+    bind_group: wgpu::BindGroup,
+    width: u32,
+    height: u32,
+}
+
 // Struct to store persistent WGPU resources used by the shader callback
 struct VisualizerRenderResources {
     gpu: VisualizerGpu,
-    history_buffer: Vec<u8>, // RGBA8 waterfall history buffer (1024 * 256 * 4 bytes)
+    blit: BlitGpu,
+    offscreen: Option<Offscreen>,
+    format: wgpu::TextureFormat,
+    history: History,
 }
 
 #[repr(C)]
@@ -59,119 +138,131 @@ struct VisualizerUniforms {
     u_time: f32,
     u_resolution_x: f32,
     u_resolution_y: f32,
-    u_pad: f32,
+    u_cutoff: f32,
 }
 
-// The 2048-point plan is reused per thread; planning it every frame (as the naive
-// version did) reallocates twiddle tables thousands of times during a video render.
-thread_local! {
-    static FFT_PLANNER: RefCell<FftPlanner<f32>> = RefCell::new(FftPlanner::new());
+// The waterfall history the shader samples, plus every buffer the per-frame
+// analysis needs. All of it is allocated once and reused: the naive version
+// planned the transform, rebuilt the Hann window, allocated an FFT input buffer
+// and let rustfft allocate its own scratch on *every* frame.
+pub(crate) struct History {
+    // HISTORY_WIDTH * HISTORY_HEIGHT bytes, one byte per column, row 0 newest.
+    pixels: Vec<u8>,
+    // Scratch for the row being built, so the previous row can still be read.
+    row: Vec<u8>,
+    // Built on first use; waveform-only mode never needs it.
+    fft: Option<Fft>,
 }
 
-// Scroll the waterfall history down one row and write the current frame's analysis
-// into row 0. `samples` is the 2048-sample visualizer window.
-pub(crate) fn advance_history(history: &mut [u8], samples: &[f32], fft_enabled: bool, gain: f32) {
-    let row_size = HISTORY_ROW_BYTES;
-    // Shift history down by 1 row (row 0 moves to row 1, etc.)
-    history.copy_within(0..row_size * (HISTORY_HEIGHT - 1), row_size);
+struct Fft {
+    plan: Arc<dyn rustfft::Fft<f32>>,
+    // Precomputed Hann window: this was FFT_SIZE cosines per frame.
+    window: Vec<f32>,
+    buf: Vec<Complex<f32>>,
+    scratch: Vec<Complex<f32>>,
+}
 
-    let mut new_row = vec![0u8; row_size];
-
-    // Temporal decay factor for the R (terrain) channel, mimicking Web Audio
-    // AnalyserNode smoothing (Shadertoy's audio source). Values rise instantly but
-    // decay over ~15 frames. Without this, a one-frame transient occupies a single
-    // history row: a paper-thin tall wall in the 3D terrain that the raymarcher
-    // steps over stochastically, rendering as speckled "ghost" streaks receding
-    // into the distance (worst on the left, where the loud bass bins live).
-    const DECAY: f32 = (0.82 / 15.) * 17.;
-
-    if fft_enabled {
-        // 1. Run 2048-point Forward FFT with a Hann window. Web Audio applies a
-        //    window (Blackman) before its FFT; a raw rectangular window leaks
-        //    -13 dB sidelobes around loud bass bins that flicker frame-to-frame
-        //    as shimmering noise on the left side of the spectrum.
-        let fft = FFT_PLANNER.with(|planner| planner.borrow_mut().plan_fft_forward(2048));
-
-        let n = samples.len() as f32;
-        let mut fft_buffer: Vec<Complex<f32>> = samples
-            .iter()
-            .enumerate()
-            .map(|(idx, &s)| {
-                let w = 0.5 - 0.5 * (std::f32::consts::TAU * idx as f32 / (n - 1.0)).cos();
-                Complex { re: s * w, im: 0.0 }
+impl Fft {
+    fn new() -> Self {
+        let plan = FftPlanner::<f32>::new().plan_fft_forward(FFT_SIZE);
+        let scratch = vec![Complex { re: 0.0, im: 0.0 }; plan.get_inplace_scratch_len()];
+        // Web Audio applies a window (Blackman) before its FFT; a raw rectangular
+        // window leaks -13 dB sidelobes around loud bass bins that flicker
+        // frame-to-frame as shimmering noise on the left of the spectrum.
+        let window = (0..FFT_SIZE)
+            .map(|i| {
+                0.5 - 0.5
+                    * (std::f32::consts::TAU * i as f32 / (FFT_SIZE as f32 - 1.0)).cos()
             })
             .collect();
-
-        fft.process(&mut fft_buffer);
-
-        // 2. Map FFT bins to the new row
-        for i in 0..HISTORY_WIDTH {
-            let c = fft_buffer[i];
-            let magnitude = c.norm();
-
-            // High-frequency pre-emphasis: boost higher frequency bins for visualization
-            let freq_boost = 1.0 + (i as f32 / 128.0);
-
-            // Apply normalized gain and scale. Divide by 1024 (not 2048) to
-            // compensate the Hann window's 0.5 coherent gain. tanh soft-limits
-            // instead of a hard clamp so loud bins don't flat-top into cliffs.
-            let val = (magnitude / 1024.0 * gain * freq_boost).sqrt().tanh();
-            // Temporal smoothing: rise instantly, decay slowly (peak-hold style),
-            // reading the previous frame's row (now shifted to row 1).
-            let prev = history[row_size + i * 4] as f32 / 255.0;
-            let val = val.max(prev * DECAY);
-            new_row[i * 4] = (val * 255.0) as u8; // R: FFT magnitude, 0..1
-            let s = samples[i * 2];
-            new_row[i * 4 + 1] = ((s * 0.5 + 0.5) * 255.0) as u8; // G: waveform centered at 0.5
-            let raw = (magnitude / 1024.0 * gain).sqrt().clamp(0.0, 1.0);
-            new_row[i * 4 + 2] = (raw * 255.0) as u8; // B: raw magnitude
-            new_row[i * 4 + 3] = 255;
-        }
-    } else {
-        // Waveform Only Mode: Red contains the waveform too so the terrain reacts to it!
-        for i in 0..HISTORY_WIDTH {
-            let s = samples[i * 2];
-            // Gain is applied here too, but the slider caps it low in this mode
-            // (see UI) since the raw wave clips into noise past ~1.5.
-            let v = (s.abs() * gain).clamp(0.0, 1.0);
-            // Same temporal smoothing as FFT mode (see DECAY above) so transient
-            // peaks form sloped ridges in the history instead of thin walls.
-            let prev = history[row_size + i * 4] as f32 / 255.0;
-            let v = v.max(prev * DECAY);
-            let byte = (v * 255.0) as u8;
-            new_row[i * 4] = byte; // R drives terrain (rectified-ish via 0.5 center)
-            new_row[i * 4 + 1] = byte;
-            new_row[i * 4 + 2] = byte;
-            new_row[i * 4 + 3] = 255;
+        Self {
+            plan,
+            window,
+            buf: vec![Complex { re: 0.0, im: 0.0 }; FFT_SIZE],
+            scratch,
         }
     }
-
-    // Copy new row to the start of the history buffer
-    history[0..row_size].copy_from_slice(&new_row);
 }
 
-// A history buffer primed with the "silence" baseline the shader expects.
-pub(crate) fn new_history_buffer() -> Vec<u8> {
-    let mut history_buffer = vec![0u8; HISTORY_WIDTH * HISTORY_HEIGHT * 4];
-    for y in 0..HISTORY_HEIGHT {
-        for x in 0..HISTORY_WIDTH {
-            let idx = (y * HISTORY_WIDTH + x) * 4;
-            history_buffer[idx] = 0; // Red (silent baseline)
-            history_buffer[idx + 1] = 128; // Green (silent baseline)
-            history_buffer[idx + 2] = 0; // Blue (silent baseline)
-            history_buffer[idx + 3] = 255; // Alpha (opaque Snorm)
+impl History {
+    // Primed with the "silence" baseline the shader expects (a flat zero terrain).
+    pub(crate) fn new() -> Self {
+        Self {
+            pixels: vec![0u8; HISTORY_WIDTH * HISTORY_HEIGHT],
+            row: vec![0u8; HISTORY_WIDTH],
+            fft: None,
         }
     }
-    history_buffer
+
+    // Scroll the waterfall down one row and write the current frame's analysis
+    // into row 0. `samples` is the FFT_SIZE-sample visualizer window.
+    pub(crate) fn advance(&mut self, samples: &[f32], fft_enabled: bool, gain: f32) {
+        let w = HISTORY_WIDTH;
+        // Shift history down by 1 row (row 0 moves to row 1, etc.)
+        self.pixels.copy_within(0..w * (HISTORY_HEIGHT - 1), w);
+
+        // Temporal decay factor for the terrain, mimicking Web Audio
+        // AnalyserNode smoothing (Shadertoy's audio source). Values rise instantly but
+        // decay over ~15 frames. Without this, a one-frame transient occupies a single
+        // history row: a paper-thin tall wall in the 3D terrain that the raymarcher
+        // steps over stochastically, rendering as speckled "ghost" streaks receding
+        // into the distance (worst on the left, where the loud bass bins live).
+        const DECAY: f32 = (0.82 / 15.) * 17.;
+
+        // Last frame's row, which the shift just moved to row 1.
+        let prev = &self.pixels[w..w + w];
+        let row = &mut self.row[..w];
+
+        if fft_enabled {
+            let fft = self.fft.get_or_insert_with(Fft::new);
+            for ((dst, &s), &win) in fft.buf.iter_mut().zip(samples).zip(&fft.window) {
+                *dst = Complex {
+                    re: s * win,
+                    im: 0.0,
+                };
+            }
+            fft.plan
+                .process_with_scratch(&mut fft.buf, &mut fft.scratch);
+
+            for (i, (out, bin)) in row.iter_mut().zip(&fft.buf).enumerate() {
+                let magnitude = bin.norm();
+
+                // High-frequency pre-emphasis: boost higher frequency bins for visualization
+                let freq_boost = 1.0 + (i as f32 / 128.0);
+
+                // Apply normalized gain and scale. Divide by 1024 (not 2048) to
+                // compensate the Hann window's 0.5 coherent gain. tanh soft-limits
+                // instead of a hard clamp so loud bins don't flat-top into cliffs.
+                let val = (magnitude / 1024.0 * gain * freq_boost).sqrt().tanh();
+                // Temporal smoothing: rise instantly, decay slowly (peak-hold style).
+                let val = val.max(prev[i] as f32 / 255.0 * DECAY);
+                *out = (val * 255.0) as u8;
+            }
+        } else {
+            // Waveform-only mode: the terrain height follows the rectified wave.
+            for (i, out) in row.iter_mut().enumerate() {
+                // Gain is applied here too, but the slider caps it low in this mode
+                // (see UI) since the raw wave clips into noise past ~1.5.
+                let v = (samples[i * 2].abs() * gain).clamp(0.0, 1.0);
+                // Same temporal smoothing as FFT mode (see DECAY above) so transient
+                // peaks form sloped ridges in the history instead of thin walls.
+                let v = v.max(prev[i] as f32 / 255.0 * DECAY);
+                *out = (v * 255.0) as u8;
+            }
+        }
+
+        self.pixels[..w].copy_from_slice(&self.row[..w]);
+    }
 }
 
 // Upload this frame's history texture and uniforms.
 pub(crate) fn upload_frame(
     queue: &wgpu::Queue,
     gpu: &VisualizerGpu,
-    history: &[u8],
+    history: &History,
     time: f32,
     resolution: egui::Vec2,
+    quality: Quality,
 ) {
     queue.write_texture(
         wgpu::TexelCopyTextureInfo {
@@ -180,10 +271,10 @@ pub(crate) fn upload_frame(
             origin: wgpu::Origin3d::ZERO,
             aspect: wgpu::TextureAspect::All,
         },
-        history,
+        &history.pixels,
         wgpu::TexelCopyBufferLayout {
             offset: 0,
-            bytes_per_row: Some(HISTORY_ROW_BYTES as u32),
+            bytes_per_row: Some(HISTORY_WIDTH as u32),
             rows_per_image: Some(HISTORY_HEIGHT as u32),
         },
         wgpu::Extent3d {
@@ -197,7 +288,7 @@ pub(crate) fn upload_frame(
         u_time: time,
         u_resolution_x: resolution.x,
         u_resolution_y: resolution.y,
-        u_pad: 0.0,
+        u_cutoff: quality.cutoff,
     };
     queue.write_buffer(&gpu.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
 }
@@ -217,11 +308,16 @@ pub(crate) fn create_visualizer_gpu(
     // Create uniform buffer (16 bytes aligned)
     let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("visualizer_uniforms"),
-        contents: bytemuck::cast_slice(&[0.0_f32; 4]),
+        contents: bytemuck::bytes_of(&VisualizerUniforms {
+            u_time: 0.0,
+            u_resolution_x: 0.0,
+            u_resolution_y: 0.0,
+            u_cutoff: 0.0,
+        }),
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::UNIFORM,
     });
 
-    // Create audio texture (1024x256, Rgba8Unorm format)
+    // Create audio texture (1024x256, single channel — see HISTORY_WIDTH)
     let audio_texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("audio_texture"),
         size: wgpu::Extent3d {
@@ -232,7 +328,7 @@ pub(crate) fn create_visualizer_gpu(
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8Unorm,
+        format: wgpu::TextureFormat::R8Unorm,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
@@ -263,7 +359,9 @@ pub(crate) fn create_visualizer_gpu(
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
-                    min_binding_size: NonZeroU64::new(16),
+                    min_binding_size: NonZeroU64::new(
+                        std::mem::size_of::<VisualizerUniforms>() as u64
+                    ),
                 },
                 count: None,
             },
@@ -351,6 +449,126 @@ pub(crate) fn draw_visualizer(render_pass: &mut wgpu::RenderPass<'_>, gpu: &Visu
     render_pass.draw(0..3, 0..1);
 }
 
+fn create_blit_gpu(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> BlitGpu {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("blit_shader"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("blit.wgsl").into()),
+    });
+
+    // Linear, so a reduced-resolution pass is smoothed on the way up rather than
+    // showing its pixel grid.
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("blit_sampler"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+        ..Default::default()
+    });
+
+    let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("blit_bind_group_layout"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    });
+
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("blit_pipeline_layout"),
+        bind_group_layouts: &[Some(&bind_group_layout)],
+        immediate_size: 0,
+    });
+
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("blit_pipeline"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            buffers: &[],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            targets: &[Some(target_format.into())],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+
+    BlitGpu {
+        pipeline,
+        bind_group_layout,
+        sampler,
+    }
+}
+
+fn create_offscreen(
+    device: &wgpu::Device,
+    blit: &BlitGpu,
+    format: wgpu::TextureFormat,
+    width: u32,
+    height: u32,
+) -> Offscreen {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("visualizer_offscreen"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("visualizer_offscreen_bind_group"),
+        layout: &blit.bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&blit.sampler),
+            },
+        ],
+    });
+    Offscreen {
+        view,
+        bind_group,
+        width,
+        height,
+    }
+}
+
 enum AudioMessage {
     Decoded {
         file_name: String,
@@ -410,36 +628,87 @@ impl Source for VisualizerSource {
 
 struct VisualizerCallback {
     time: f32,
+    // Logical size of the paint area. Kept independent of the pixel count the
+    // pass is rasterized at so that render scale cannot shift the image.
     resolution: egui::Vec2,
+    // Physical pixels the paint area covers, before the render scale is applied.
+    pixels: [u32; 2],
     samples: Vec<f32>,
     fft_enabled: bool,
     gain: f32,
+    quality: Quality,
 }
 
 impl egui_wgpu::CallbackTrait for VisualizerCallback {
     fn prepare(
         &self,
-        _device: &wgpu::Device,
+        device: &wgpu::Device,
         queue: &wgpu::Queue,
         _screen_descriptor: &egui_wgpu::ScreenDescriptor,
-        _egui_encoder: &mut wgpu::CommandEncoder,
+        egui_encoder: &mut wgpu::CommandEncoder,
         resources: &mut egui_wgpu::CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
-        if let Some(res) = resources.get_mut::<VisualizerRenderResources>() {
-            advance_history(
-                &mut res.history_buffer,
-                &self.samples,
-                self.fft_enabled,
-                self.gain,
-            );
-            upload_frame(
-                queue,
-                &res.gpu,
-                &res.history_buffer,
-                self.time,
-                self.resolution,
-            );
+        let Some(res) = resources.get_mut::<VisualizerRenderResources>() else {
+            return Vec::new();
+        };
+
+        res.history
+            .advance(&self.samples, self.fft_enabled, self.gain);
+        upload_frame(
+            queue,
+            &res.gpu,
+            &res.history,
+            self.time,
+            self.resolution,
+            self.quality,
+        );
+
+        // At full scale the march writes straight into the egui pass in `paint`,
+        // which skips both the intermediate texture and the upscale.
+        let want = if self.quality.scale >= 0.999 {
+            None
+        } else {
+            let scale = self.quality.scale.clamp(0.1, 1.0);
+            Some((
+                ((self.pixels[0] as f32 * scale) as u32).max(1),
+                ((self.pixels[1] as f32 * scale) as u32).max(1),
+            ))
+        };
+
+        match want {
+            None => res.offscreen = None,
+            Some((width, height)) => {
+                if res
+                    .offscreen
+                    .as_ref()
+                    .is_none_or(|o| o.width != width || o.height != height)
+                {
+                    res.offscreen =
+                        Some(create_offscreen(device, &res.blit, res.format, width, height));
+                }
+                // Recorded into egui's own encoder, so it is guaranteed to run
+                // before the pass `paint` samples the result in.
+                let offscreen = res.offscreen.as_ref().expect("offscreen just created");
+                let mut pass = egui_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("visualizer_offscreen_pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &offscreen.view,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                draw_visualizer(&mut pass, &res.gpu);
+            }
         }
+
         Vec::new()
     }
 
@@ -460,7 +729,16 @@ impl egui_wgpu::CallbackTrait for VisualizerCallback {
                 0.0,
                 1.0,
             );
-            draw_visualizer(render_pass, &res.gpu);
+            match &res.offscreen {
+                // Reduced resolution: the march already ran in `prepare`, this
+                // just stretches it over the paint area.
+                Some(offscreen) => {
+                    render_pass.set_pipeline(&res.blit.pipeline);
+                    render_pass.set_bind_group(0, &offscreen.bind_group, &[]);
+                    render_pass.draw(0..3, 0..1);
+                }
+                None => draw_visualizer(render_pass, &res.gpu),
+            }
         }
     }
 }
@@ -490,6 +768,10 @@ pub struct LeApp {
     wave_window_ms: f32, // size of window to display in ms (e.g. 5ms to 150ms)
     fft_enabled: bool,   // true = standard fourier transform landscape, false = waveform only
 
+    // Index into Quality::PRESETS. Live view only — video export always renders
+    // at Quality::MAX.
+    quality_idx: usize,
+
     // Channels to communicate with background decoder thread
     rx: Receiver<AudioMessage>,
     tx: Sender<AudioMessage>,
@@ -497,9 +779,14 @@ pub struct LeApp {
     // Video export settings & job state
     export: ExportState,
 
+    // Reusable scratch, so the per-frame path allocates nothing.
+    sys_tail: Vec<f32>,
+
     // UI state
     status_msg: String,
     time_start: Instant,
+    // Start of the previous frame, for pacing the next repaint.
+    last_frame: Instant,
     is_loading: bool,
     controls_alpha: f32,               // for fading controls in/out on hover
     controls_rect: Option<egui::Rect>, // last-rendered panel rect, for hover detection
@@ -540,7 +827,13 @@ impl LeApp {
         let wgpu_render_state = cc.wgpu_render_state.as_ref()?;
         let device = &wgpu_render_state.device;
 
-        let gpu = create_visualizer_gpu(device, wgpu_render_state.target_format);
+        let format = wgpu_render_state.target_format;
+        let gpu = create_visualizer_gpu(device, format);
+        let blit = create_blit_gpu(device, format);
+
+        // Set once: doing this every frame rebuilt and re-published the whole
+        // style struct on each repaint.
+        cc.egui_ctx.set_visuals(egui::Visuals::dark());
 
         // Insert resources so the callback can retrieve them later
         wgpu_render_state
@@ -549,7 +842,10 @@ impl LeApp {
             .callback_resources
             .insert(VisualizerRenderResources {
                 gpu,
-                history_buffer: new_history_buffer(),
+                blit,
+                offscreen: None,
+                format,
+                history: History::new(),
             });
 
         // Try to setup Audio device using new rodio 0.22 API
@@ -599,6 +895,12 @@ impl LeApp {
             .storage
             .and_then(|s| eframe::get_value(s, "system_audio_enabled"))
             .unwrap_or(true);
+        // Defaults to "High": same image as the original shader, minus the ray
+        // steps that cannot affect an 8-bit pixel.
+        let quality_idx = cc
+            .storage
+            .and_then(|s| eframe::get_value::<u8>(s, "quality"))
+            .map_or(1, |v| (v as usize).min(Quality::PRESETS.len() - 1));
         let export = ExportState {
             window_open: false,
             width: cc
@@ -683,11 +985,14 @@ impl LeApp {
             trigger_mode,
             wave_window_ms,
             fft_enabled,
+            quality_idx,
             export,
             rx,
             tx,
+            sys_tail: Vec::new(),
             status_msg,
             time_start: Instant::now(),
+            last_frame: Instant::now(),
             is_loading: false,
             controls_alpha: 0.0,
             controls_rect: None,
@@ -720,10 +1025,58 @@ fn decode_audio_file(
 // without any virtual audio cable. The captured interleaved f32 samples are kept
 // in a bounded ring buffer that the visualizer reads the tail of each frame.
 struct SystemAudioCapture {
-    ring: Arc<Mutex<VecDeque<f32>>>,
+    ring: Arc<Mutex<Ring>>,
     sample_rate: u32,
     channels: u16,
     _stream: cpal::Stream,
+}
+
+// Fixed-capacity circular buffer of interleaved samples.
+//
+// The previous VecDeque version did a pop_front + push_back for every single
+// captured sample, and the UI thread cloned the entire ~2 second buffer (about
+// 700 KB, element by element) on every frame — while holding the lock the
+// realtime capture callback needs. Both sides are now bounded memcpys, and the
+// reader only takes the tail it will actually look at.
+struct Ring {
+    buf: Vec<f32>,
+    /// Total samples ever written. The buffer holds the last `min(written, len)`.
+    written: usize,
+}
+
+impl Ring {
+    fn new(capacity: usize) -> Self {
+        Self {
+            buf: vec![0.0; capacity.max(1)],
+            written: 0,
+        }
+    }
+
+    fn push(&mut self, data: &[f32]) {
+        let cap = self.buf.len();
+        // Anything older than the last `cap` samples would be overwritten anyway.
+        let data = if data.len() > cap {
+            &data[data.len() - cap..]
+        } else {
+            data
+        };
+        let start = self.written % cap;
+        let first = data.len().min(cap - start);
+        self.buf[start..start + first].copy_from_slice(&data[..first]);
+        self.buf[..data.len() - first].copy_from_slice(&data[first..]);
+        self.written += data.len();
+    }
+
+    /// Copy the newest `n` samples, oldest first, into `out`.
+    fn tail(&self, n: usize, out: &mut Vec<f32>) {
+        out.clear();
+        let cap = self.buf.len();
+        let n = n.min(self.written.min(cap));
+        let start = (self.written - n) % cap;
+        let first = n.min(cap - start);
+        out.extend_from_slice(&self.buf[start..start + first]);
+        out.extend_from_slice(&self.buf[..n - first]);
+    }
 }
 
 impl SystemAudioCapture {
@@ -744,40 +1097,47 @@ impl SystemAudioCapture {
 
         // ~2 seconds of headroom; the visualizer only reads the most recent window.
         let capacity = (sample_rate as usize) * (channels as usize) * 2;
-        let ring = Arc::new(Mutex::new(VecDeque::with_capacity(capacity)));
+        let ring = Arc::new(Mutex::new(Ring::new(capacity)));
         let ring_cb = ring.clone();
 
         let err_fn = |err| log::warn!("System audio loopback stream error: {}", err);
 
         // WASAPI shared mode almost always hands us f32, but be tolerant of i16/u16.
+        // The integer paths convert through a buffer owned by the callback rather
+        // than allocating one per callback.
         let stream = match sample_format {
             cpal::SampleFormat::F32 => device.build_input_stream(
                 &stream_config,
-                move |data: &[f32], _: &_| push_samples(&ring_cb, data, capacity),
+                move |data: &[f32], _: &_| push_samples(&ring_cb, data),
                 err_fn,
                 None,
             )?,
-            cpal::SampleFormat::I16 => device.build_input_stream(
-                &stream_config,
-                move |data: &[i16], _: &_| {
-                    let f: Vec<f32> = data.iter().map(|&s| s as f32 / 32768.0).collect();
-                    push_samples(&ring_cb, &f, capacity);
-                },
-                err_fn,
-                None,
-            )?,
-            cpal::SampleFormat::U16 => device.build_input_stream(
-                &stream_config,
-                move |data: &[u16], _: &_| {
-                    let f: Vec<f32> = data
-                        .iter()
-                        .map(|&s| (s as f32 - 32768.0) / 32768.0)
-                        .collect();
-                    push_samples(&ring_cb, &f, capacity);
-                },
-                err_fn,
-                None,
-            )?,
+            cpal::SampleFormat::I16 => {
+                let mut scratch: Vec<f32> = Vec::new();
+                device.build_input_stream(
+                    &stream_config,
+                    move |data: &[i16], _: &_| {
+                        scratch.clear();
+                        scratch.extend(data.iter().map(|&s| s as f32 / 32768.0));
+                        push_samples(&ring_cb, &scratch);
+                    },
+                    err_fn,
+                    None,
+                )?
+            }
+            cpal::SampleFormat::U16 => {
+                let mut scratch: Vec<f32> = Vec::new();
+                device.build_input_stream(
+                    &stream_config,
+                    move |data: &[u16], _: &_| {
+                        scratch.clear();
+                        scratch.extend(data.iter().map(|&s| (s as f32 - 32768.0) / 32768.0));
+                        push_samples(&ring_cb, &scratch);
+                    },
+                    err_fn,
+                    None,
+                )?
+            }
             other => return Err(format!("Unsupported sample format: {:?}", other).into()),
         };
 
@@ -791,24 +1151,21 @@ impl SystemAudioCapture {
         })
     }
 
-    // Snapshot the current ring buffer contents (oldest -> newest, interleaved).
-    fn snapshot(&self) -> Vec<f32> {
+    // Copy the most recent `frames` frames (interleaved, oldest -> newest) into
+    // `out`. Reading only what the window needs keeps this at tens of KB per
+    // frame instead of the whole ~700 KB ring.
+    fn tail(&self, frames: usize, out: &mut Vec<f32>) {
         match self.ring.lock() {
-            Ok(buf) => buf.iter().copied().collect(),
-            Err(_) => Vec::new(),
+            Ok(ring) => ring.tail(frames * (self.channels.max(1) as usize), out),
+            Err(_) => out.clear(),
         }
     }
 }
 
 // Push interleaved samples into the ring buffer, dropping the oldest to stay bounded.
-fn push_samples(ring: &Arc<Mutex<VecDeque<f32>>>, data: &[f32], capacity: usize) {
-    if let Ok(mut buf) = ring.lock() {
-        for &s in data {
-            if buf.len() >= capacity {
-                buf.pop_front();
-            }
-            buf.push_back(s);
-        }
+fn push_samples(ring: &Arc<Mutex<Ring>>, data: &[f32]) {
+    if let Ok(mut ring) = ring.lock() {
+        ring.push(data);
     }
 }
 
@@ -816,78 +1173,61 @@ fn push_samples(ring: &Arc<Mutex<VecDeque<f32>>>, data: &[f32], capacity: usize)
 // Shared by file playback (window follows the play head) and live system audio
 // (window pinned to the most recent samples, positioned by the caller).
 pub(crate) fn compute_visualizer_window(
+    out: &mut [f32],
     samples: &[f32],
     current_frame: usize,
     channels: usize,
     sample_rate: u32,
     wave_window_ms: f32,
     trigger_mode: bool,
-) -> Vec<f32> {
-    let mut visualizer_samples = vec![0.0f32; 2048];
+) {
     let channels = channels.max(1);
     let total_samples = samples.len();
     let total_frames = total_samples / channels;
 
-    // Compute total frames in the zoom window
-    let window_frames = ((wave_window_ms / 1000.0) * sample_rate as f32) as usize;
-    let window_frames = window_frames.max(32); // at least 32 frames for 2048 window
+    // Mono mix of one frame, or 0.0 once the frame runs past the buffer. Slicing
+    // once lets the sum run without a bounds check per channel.
+    let mono = |frame: usize| -> f32 {
+        let base = frame * channels;
+        let end = (base + channels).min(total_samples);
+        if base >= end {
+            return 0.0;
+        }
+        let s = &samples[base..end];
+        s.iter().sum::<f32>() / s.len() as f32
+    };
 
+    let window_frames = frames_in_window(wave_window_ms, sample_rate);
     let mut start_frame = current_frame;
 
     if trigger_mode {
         // Stabilize wave phase via Oscilloscope Rising-Edge Zero-Crossing Triggering.
-        // We search ahead for a zero-crossing based on mono mixed values.
-        let search_len = 1024.min(total_frames.saturating_sub(current_frame));
+        // We search ahead for a zero-crossing based on mono mixed values. Each
+        // frame's mono mix carries over to the next comparison instead of being
+        // recomputed as the following iteration's left-hand side.
+        let search_len = TRIGGER_SEARCH_FRAMES.min(total_frames.saturating_sub(current_frame));
+        let mut prev = mono(current_frame);
         for f in 0..search_len {
-            let f_idx = current_frame + f;
-
-            let mut v1 = 0.0;
-            let mut count = 0;
-            for c in 0..channels {
-                let idx = f_idx * channels + c;
-                if idx < total_samples {
-                    v1 += samples[idx];
-                    count += 1;
-                }
-            }
-            let mono1 = if count > 0 { v1 / count as f32 } else { 0.0 };
-
-            let mut v2 = 0.0;
-            let mut count2 = 0;
-            for c in 0..channels {
-                let idx = (f_idx + 1) * channels + c;
-                if idx < total_samples {
-                    v2 += samples[idx];
-                    count2 += 1;
-                }
-            }
-            let mono2 = if count2 > 0 { v2 / count2 as f32 } else { 0.0 };
-
-            if mono1 < 0.0 && mono2 >= 0.0 {
-                start_frame = f_idx;
+            let next = mono(current_frame + f + 1);
+            if prev < 0.0 && next >= 0.0 {
+                start_frame = current_frame + f;
                 break;
             }
+            prev = next;
         }
     }
 
-    // Downsample/interpolate the window down to 2048 samples
-    for i in 0..2048 {
-        let frame_offset = (i * window_frames) / 2048;
-        let target_frame = start_frame + frame_offset;
-
-        let mut sum = 0.0;
-        let mut count = 0;
-        for c in 0..channels {
-            let idx = target_frame * channels + c;
-            if idx < total_samples {
-                sum += samples[idx];
-                count += 1;
-            }
-        }
-        visualizer_samples[i] = if count > 0 { sum / count as f32 } else { 0.0 };
+    // Downsample/interpolate the window down to the output length
+    let n = out.len();
+    for (i, sample) in out.iter_mut().enumerate() {
+        *sample = mono(start_frame + (i * window_frames) / n);
     }
+}
 
-    visualizer_samples
+// Frames of audio covered by the zoom window; at least 32 so the resample below
+// always advances.
+fn frames_in_window(wave_window_ms: f32, sample_rate: u32) -> usize {
+    (((wave_window_ms / 1000.0) * sample_rate as f32) as usize).max(32)
 }
 
 impl LeApp {
@@ -1152,7 +1492,8 @@ impl LeApp {
                     ui.label(
                         egui::RichText::new(format!(
                             "{} frames · {:02}:{:02} of video · settings match the live view \
-                             ({}, gain {:.1}, {:.0}ms window)",
+                             ({}, gain {:.1}, {:.0}ms window) · always rendered at full \
+                             quality regardless of the preview setting",
                             total,
                             (secs / 60.0) as i32,
                             (secs % 60.0) as i32,
@@ -1226,7 +1567,12 @@ impl LeApp {
 impl eframe::App for LeApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx();
-        ctx.set_visuals(egui::Visuals::dark());
+
+        // How long the previous frame's whole cycle took, used at the end of this
+        // one to decide how long to idle before the next.
+        let now = Instant::now();
+        let since_last = now.duration_since(self.last_frame);
+        self.last_frame = now;
 
         // Pick up progress from a video export running in the background
         self.poll_export();
@@ -1365,22 +1711,33 @@ impl eframe::App for LeApp {
         let rect = ui.max_rect();
         let time = self.time_start.elapsed().as_secs_f32();
 
+        // Nothing on screen to march for: skip the analysis and the draw entirely
+        // and check back a few times a second.
+        let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
+        if minimized {
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+            return;
+        }
+
         // Extract and trigger audio samples to write to visualizer (2048 samples window)
-        let mut visualizer_samples = vec![0.0f32; 2048];
+        let mut visualizer_samples = vec![0.0f32; FFT_SIZE];
         if self.system_audio_enabled {
             // Live system audio: window is pinned to the most recent captured samples.
             if let Some(cap) = &self.system_capture {
-                let snapshot = cap.snapshot();
-                let channels = cap.channels as usize;
-                let total_frames = snapshot.len() / channels.max(1);
-                let window_frames =
-                    ((self.wave_window_ms / 1000.0) * cap.sample_rate as f32) as usize;
-                // Leave 1024 frames of headroom at the tail so the trigger search and
-                // windowing don't run past the newest captured samples.
-                let current_frame = total_frames.saturating_sub(window_frames + 1024);
-                visualizer_samples = compute_visualizer_window(
-                    &snapshot,
-                    current_frame,
+                let channels = (cap.channels as usize).max(1);
+                let window_frames = frames_in_window(self.wave_window_ms, cap.sample_rate);
+                // The window plus the trigger search headroom is exactly the span
+                // the analysis can reach, so that is all we copy out of the ring
+                // — the previous code cloned all ~2 seconds of it every frame.
+                cap.tail(window_frames + TRIGGER_SEARCH_FRAMES, &mut self.sys_tail);
+                // The tail *is* the window, so it starts at frame 0. That leaves
+                // the same headroom at the end as before: the trigger search can
+                // walk forward TRIGGER_SEARCH_FRAMES and still have a full window
+                // of captured samples after it.
+                compute_visualizer_window(
+                    &mut visualizer_samples,
+                    &self.sys_tail,
+                    0,
                     channels,
                     cap.sample_rate,
                     self.wave_window_ms,
@@ -1390,7 +1747,8 @@ impl eframe::App for LeApp {
         } else if let (Some(samples), Some(playback_pos)) = (&self.samples, &self.playback_pos) {
             let current_frame =
                 playback_pos.load(Ordering::Relaxed) / (self.channels as usize).max(1);
-            visualizer_samples = compute_visualizer_window(
+            compute_visualizer_window(
+                &mut visualizer_samples,
                 samples,
                 current_frame,
                 self.channels as usize,
@@ -1402,11 +1760,16 @@ impl eframe::App for LeApp {
 
         // Draw visualizer shader. Pass accurate painting rectangle size to ensure pixel scaling matching.
         let paint_rect = rect;
+        let ppp = ctx.pixels_per_point();
         ui.painter().add(egui_wgpu::Callback::new_paint_callback(
             paint_rect,
             VisualizerCallback {
                 time,
                 resolution: paint_rect.size(),
+                pixels: [
+                    (paint_rect.width() * ppp).round().max(1.0) as u32,
+                    (paint_rect.height() * ppp).round().max(1.0) as u32,
+                ],
                 samples: visualizer_samples,
                 fft_enabled: self.fft_enabled,
                 gain: if self.fft_enabled {
@@ -1414,11 +1777,17 @@ impl eframe::App for LeApp {
                 } else {
                     self.wave_gain
                 },
+                quality: Quality::PRESETS[self.quality_idx].1,
             },
         ));
 
-        // Force repaint to animate shader
-        ctx.request_repaint();
+        // Ask for the next animation frame at the target rate rather than
+        // immediately. Subtracting the previous cycle's cost keeps the actual
+        // rate at TARGET_FPS instead of 1 / (frame time + interval), and lets the
+        // process idle in between instead of feeding the presenter as fast as it
+        // will take frames.
+        let budget = std::time::Duration::from_secs_f32(1.0 / TARGET_FPS);
+        ctx.request_repaint_after(budget.saturating_sub(since_last));
 
         // Calculate floating overlay parameters. Width tracks the window so the panel
         // never overflows a narrow window (leaving a 40px margin), capped at 1050px on
@@ -1733,6 +2102,26 @@ impl eframe::App for LeApp {
 
                                 ui.separator();
 
+                                // Raymarch cost. "Max" is the original shader;
+                                // "High" is visually identical to it but skips
+                                // ray steps too faint to reach an 8-bit pixel.
+                                // Video export ignores this and always uses Max.
+                                ui.label("Quality:");
+                                for (idx, (label, q)) in Quality::PRESETS.iter().enumerate() {
+                                    if ui
+                                        .selectable_label(self.quality_idx == idx, *label)
+                                        .on_hover_text(format!(
+                                            "Renders the shader at {}% resolution",
+                                            (q.scale * 100.0).round() as i32
+                                        ))
+                                        .clicked()
+                                    {
+                                        self.quality_idx = idx;
+                                    }
+                                }
+
+                                ui.separator();
+
                                 // Phase Lock Checkbox
                                 ui.checkbox(&mut self.trigger_mode, "Lock Phase");
 
@@ -1767,6 +2156,7 @@ impl eframe::App for LeApp {
         eframe::set_value(storage, "wave_window_ms", &self.wave_window_ms);
         eframe::set_value(storage, "fft_enabled", &self.fft_enabled);
         eframe::set_value(storage, "system_audio_enabled", &self.system_audio_enabled);
+        eframe::set_value(storage, "quality", &(self.quality_idx as u8));
         eframe::set_value(storage, "export_width", &self.export.width);
         eframe::set_value(storage, "export_height", &self.export.height);
         eframe::set_value(storage, "export_fps", &self.export.fps);

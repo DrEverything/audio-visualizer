@@ -324,7 +324,11 @@ fn render(
     }
     let mut stdin = child.stdin.take().ok_or("ffmpeg stdin unavailable")?;
 
-    let mut history = crate::new_history_buffer();
+    let mut history = crate::History::new();
+    // The live view's quality presets are a preview knob; a video always gets the
+    // full-resolution, full-step march.
+    let quality = crate::Quality::MAX;
+    let mut window = vec![0.0f32; crate::FFT_SIZE];
     // Only needed when rows come back padded; otherwise frames go straight from the
     // mapped buffer into the pipe.
     let rows_padded = padded_row != unpadded_row;
@@ -398,7 +402,8 @@ fn render(
 
         let t = frame as f64 / req.fps as f64;
         let audio_frame = (t * req.sample_rate as f64) as usize;
-        let window = crate::compute_visualizer_window(
+        crate::compute_visualizer_window(
+            &mut window,
             &req.samples,
             audio_frame,
             channels,
@@ -406,8 +411,8 @@ fn render(
             req.wave_window_ms,
             req.trigger_mode,
         );
-        crate::advance_history(&mut history, &window, req.fft_enabled, req.gain);
-        crate::upload_frame(&queue, &gpu, &history, t as f32, resolution);
+        history.advance(&window, req.fft_enabled, req.gain);
+        crate::upload_frame(&queue, &gpu, &history, t as f32, resolution, quality);
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("offline_frame"),
