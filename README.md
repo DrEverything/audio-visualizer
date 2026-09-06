@@ -7,6 +7,8 @@
 A ray marched audio visualizer built using **Rust**, **eframe (egui + wgpu)**, **rodio**, and **rustfft**. It also has persistent state, mostly :P
 Drag and drop an audio file and everything should start automatically.
 
+I only tested in on Windows and there is a high chance that it won't work on MacOS (it for sure partly won't work, because it needs a different mechanism for reading the live audio of your computer)
+
 ## Installation & Setup
 
 1. Make sure you have the [Rust toolchain](https://rustup.rs/) installed.
@@ -36,7 +38,7 @@ This needs [**ffmpeg**](https://ffmpeg.org/download.html) on your PATH.
 
 By default the export uses your GPU's video encoder (NVENC / QSV / AMF) if one is
 actually working on your machine, which is what keeps the export GPU-bound instead of
-encoder-bound — on a GTX 1070 at 1080p60 that's **~130 frames/sec vs ~38** for x264,
+encoder-bound on a GTX 1070 at 1080p60 that's **~130 frames/sec vs ~38** for x264,
 at matched quality and file size. Pick **CPU (x264)** in the export window if you want
 the last few percent of compression instead.
 
@@ -51,7 +53,7 @@ audio-visualizer --render song.mp3 --size 1920x1080 --fps 60
       --size <WxH>       Video size (default: 1920x1080)
       --fps <n>          Frame rate (default: 60)
       --crf <n>          Quality, lower is better (default: 18)
-      --encoder <e>      auto | gpu | cpu  (default: auto — hardware if available)
+      --encoder <e>      auto | gpu | cpu  (default: auto hardware if available)
       --speed <s>        x264 preset: fast | balanced | best (default: balanced)
       --fft              Use the FFT + wave mode instead of waveform only
       --gain <f>         Visual gain (default: 1.0 waveform / 4.0 with --fft)
