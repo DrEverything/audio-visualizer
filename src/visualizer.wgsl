@@ -79,16 +79,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         d = 0.1 * (0.1 * r + abs(p.y) / (one_r * one_r) + max(d_inner, -d_inner * 0.1));
         z += d;
 
-        // Loop update for color. One reciprocal instead of two divides. The
-        // four-wide cos is left as it was: folding it into a single cos/sin plus
-        // a rotation measured *slower* than the hardware's vector version.
+        // Loop update for color.
         let w = 1.0 / (d*2.0 * z);
         let cos_val = cos(vec4(z * 0.5 + u_time) + vec4(0.0, 2.0, 4.0, 3.0));
         color += (cos_val + 1.3) * w;
 
-        // This step is too faint to reach the target, and every later one is
-        // fainter still. Deliberately the *only* test in the loop: an additional
-        // "accumulator has saturated the tanh" check was exact, but cost 13%.
         if (w < cutoff) { break; }
     }
 
