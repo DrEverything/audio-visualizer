@@ -80,7 +80,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         z += d;
 
         // Loop update for color.
-        let w = 1.0 / (d*2.0 * z);
+        let w = 1.0 / (d*2.5 * z);
         let cos_val = cos(vec4(z * 0.5 + u_time) + vec4(0.0, 2.0, 4.0, 3.0));
         color += (cos_val + 1.3) * w;
 
